@@ -70,7 +70,30 @@ impl Bot {
 
     // ---------- Socket Mode dispatch ----------
 
+    /// Every Socket Mode envelope lands here. The owner's are handled; other team members' go to their own prbot.
     pub async fn handle(self: Arc<Self>, kind: String, payload: Value) {
+        let ev = &payload["event"];
+        let human_dm = ev["type"] == "message" && ev["channel_type"] == "im" && ev.get("bot_id").is_none() && ev.get("subtype").is_none();
+        let sender = match kind.as_str() {
+            "slash_commands" => payload["user_id"].as_str(),
+            "interactive" => payload["user"]["id"].as_str(),
+            "events_api" if human_dm || ev["type"] == "app_home_opened" => ev["user"].as_str(),
+            _ => None,
+        };
+        match sender {
+            Some(user) if user == self.owner => self.handle_own(kind, payload).await,
+            // Their prbot publishes their Home tab itself.
+            Some(_) if ev["type"] == "app_home_opened" => {}
+            Some(user) => {
+                if let Err(e) = self.forward(&kind, &payload, user).await {
+                    crate::log(&format!("could not forward {kind} to {user}: {e:#}"));
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub async fn handle_own(self: Arc<Self>, kind: String, payload: Value) {
         let result = match kind.as_str() {
             "slash_commands" => self.on_slash(payload).await,
             "events_api" => self.on_event(payload).await,
@@ -85,34 +108,15 @@ impl Bot {
 
     async fn on_slash(self: &Arc<Self>, p: Value) -> Result<()> {
         let response_url = p["response_url"].as_str().unwrap_or_default().to_string();
-        let reply = if p["user_id"] != self.owner.as_str() {
-            self.not_yours()
-        } else {
-            self.command(p["text"].as_str().unwrap_or_default()).await?
-        };
+        let reply = self.command(p["text"].as_str().unwrap_or_default()).await?;
         self.slack.respond(&response_url, &reply).await
     }
 
     async fn on_event(self: &Arc<Self>, p: Value) -> Result<()> {
         let ev = &p["event"];
         let from_owner = ev["user"] == self.owner.as_str();
-        let human_dm = ev["channel_type"] == "im" && ev.get("bot_id").is_none() && ev.get("subtype").is_none();
         match ev["type"].as_str().unwrap_or_default() {
             "app_home_opened" if from_owner && ev["tab"] == "home" => self.refresh_home().await,
-            // Someone else found the app: explain whose it is and how to get one.
-            "app_home_opened" if ev["tab"] == "home" => {
-                if let Some(user) = ev["user"].as_str() {
-                    let view = json!({ "type": "home", "blocks": [
-                        { "type": "section", "text": { "type": "mrkdwn", "text": self.not_yours() } }
-                    ] });
-                    self.slack.publish_home(user, view).await?;
-                }
-            }
-            "message" if !from_owner && human_dm => {
-                if let Some(channel) = ev["channel"].as_str() {
-                    self.slack.post(channel, &self.not_yours(), None, None).await?;
-                }
-            }
             "message"
                 if from_owner
                     && ev["channel_type"] == "im"
@@ -312,15 +316,6 @@ impl Bot {
         };
         self.refresh_home().await;
         Ok(reply)
-    }
-
-    /// What everyone except the owner sees.
-    fn not_yours(&self) -> String {
-        format!(
-            "This is <@{}>'s personal PR reviewer, so it only works for them. To get your own, which reviews the PRs that request *your* review using your GitHub and Claude accounts, follow the quickstart at {} (about 5 minutes).",
-            self.owner,
-            env!("CARGO_PKG_REPOSITORY")
-        )
     }
 
     pub fn status_text(&self) -> String {
@@ -548,13 +543,18 @@ impl Bot {
                 url
             }
         };
-        let mut blocks = p["message"]["blocks"].as_array().cloned().unwrap_or_default();
+        // A click forwarded by another team member's prbot arrives without the message itself.
+        let message = match p["message"].is_null() {
+            true => self.slack.message(&channel, &ts).await?,
+            false => p["message"].clone(),
+        };
+        let mut blocks = message["blocks"].as_array().cloned().unwrap_or_default();
         blocks.retain(|b| b["type"] != "actions");
         blocks.push(json!({
             "type": "context",
             "elements": [{ "type": "mrkdwn", "text": format!(":white_check_mark: Posted to the PR: <{link}|view on GitHub>") }]
         }));
-        let text = p["message"]["text"].as_str().unwrap_or("PR review").to_string();
+        let text = message["text"].as_str().unwrap_or("PR review").to_string();
         self.slack.update(&channel, &ts, &text, Some(Value::Array(blocks))).await
     }
 

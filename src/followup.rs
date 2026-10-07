@@ -245,6 +245,14 @@ impl Bot {
         let c = self.claude.complete(&settings, SYSTEM, &prompt).await?;
         let text = c.text.trim();
         if text.is_empty() || text.contains("NO_REPLY") {
+            // Nothing to say, but show it was read.
+            let reacted = match comment.path {
+                Some(_) => self.gh.react_to_review_comment(pr, comment.id, "+1").await,
+                None => self.gh.react_to_issue_comment(pr, comment.id, "+1").await,
+            };
+            if let Err(e) = reacted {
+                crate::log(&format!("could not react to {}: {e:#}", comment.url));
+            }
             return Ok(None);
         }
         let body = format!("{text}\n\n<sub>🤖 Reply written by Claude via @{login}'s review bot, not reviewed by @{login}.</sub>");

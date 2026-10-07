@@ -4,6 +4,7 @@
 use crate::claude::Settings;
 use crate::config::{self, var};
 use crate::github::GitHub;
+use crate::lifecycle;
 use crate::slack::Slack;
 use crate::state::{State, Store};
 use anyhow::{bail, Context, Result};
@@ -26,7 +27,8 @@ pub async fn setup(http: &Client) -> Result<()> {
     let mut env = EnvFile::load(&path)?;
     println!("prbot setup. Settings are saved to {}", path.display());
 
-    heading("1/4 GitHub");
+    heading("1/5 GitHub");
+    ensure_installed("gh")?;
     let login = loop {
         match check_github(http).await {
             Ok(login) => break login,
@@ -35,18 +37,22 @@ pub async fn setup(http: &Client) -> Result<()> {
                 if !confirm("Log in to GitHub now with `gh auth login`?", true) {
                     bail!("GitHub is not set up");
                 }
-                run_interactive("gh", &["auth", "login"])?;
+                run_interactive("gh", &["auth", "login", "--web"])?;
             }
             Err(e) => return Err(e),
         }
     };
     println!("✓ GitHub: @{login}");
 
-    heading("2/4 Claude");
+    heading("2/5 Claude");
+    let mut claude_email = None;
     if let Ok(key) = var("ANTHROPIC_API_KEY") {
         println!("✓ Claude: {}", check_api_key(http, &key).await?);
     } else {
         let bin = config::claude_bin();
+        if bin == "claude" {
+            ensure_installed("claude")?;
+        }
         let who = loop {
             match check_claude_cli(&bin) {
                 Ok(who) => break who,
@@ -61,26 +67,43 @@ pub async fn setup(http: &Client) -> Result<()> {
             }
         };
         println!("✓ Claude Code: {who}");
+        claude_email = cli_email(&bin);
     }
 
-    heading("3/4 Slack app");
+    heading("3/5 Slack");
     let mut app_token = var("SLACK_APP_TOKEN").ok();
     let mut bot_token = var("SLACK_BOT_TOKEN").ok();
-    // Named after the GitHub login so teammates' apps are easy to tell apart (Slack allows 35 characters).
-    let mut app_name = Some(format!("PR Reviewer ({login})")).filter(|n| n.chars().count() <= 35).unwrap_or_else(|| "PR Reviewer".into());
+    // Named after the GitHub login so apps are easy to tell apart (Slack allows 35 characters).
+    let mut app_name = Some(format!("PR Reviewer ({login})"))
+        .filter(|n| n.chars().count() <= 35)
+        .unwrap_or_else(|| "PR Reviewer".into());
     let mut fresh = false;
+    let mut joined = false;
     if let (Some(app), Some(bot)) = (&app_token, &bot_token) {
         if let Ok(team) = check_slack(http, bot, app).await {
             println!("✓ Already connected to the Slack workspace {team}.");
-            if confirm("Create a new Slack app anyway?", false) {
+            if confirm("Connect to a different Slack app?", false) {
                 (app_token, bot_token, fresh) = (None, None, true);
             }
         }
     }
-    let app_ok = match &app_token {
+    let mut app_ok = match &app_token {
         Some(t) => Slack::new(http.clone(), String::new(), t.clone()).socket_url().await.is_ok(),
         None => false,
     };
+    if !app_ok && bot_token.is_none() {
+        println!("If your team already uses prbot, paste the team code a teammate sent you (they get it with `prbot invite`).");
+        let code = secret("Team code, or press Enter to create your own Slack app instead")?;
+        if !code.is_empty() {
+            let (bot, app) = decode_team_code(&code)?;
+            let team = check_slack(http, &bot, &app).await.context("the team code doesn't work (ask for a fresh one)")?;
+            env.set("SLACK_BOT_TOKEN", &bot);
+            env.set("SLACK_APP_TOKEN", &app);
+            env.save()?;
+            println!("✓ Joined your team's prbot app in the Slack workspace {team}.");
+            (bot_token, app_token, fresh, app_ok, joined) = (Some(bot), Some(app), true, true, true);
+        }
+    }
     if !app_ok {
         fresh = true;
         app_name = ask("Name for your Slack app", &app_name);
@@ -146,16 +169,11 @@ pub async fn setup(http: &Client) -> Result<()> {
     }
     let slack = Slack::new(http.clone(), bot_token.expect("set above"), app_token);
 
-    heading("4/4 You in Slack");
+    heading("4/5 You in Slack");
     let owner = match var("SLACK_OWNER_ID") {
         Ok(id) if !fresh && slack.open_dm(&id).await.is_ok() => id,
         _ => {
-            println!("prbot only listens to you. To find out who you are in Slack:");
-            println!("open Slack, find \"{app_name}\" under Apps in the sidebar (or search for it) and send it any message,");
-            println!("or run /prreview in any channel. Waiting…");
-            let id = tokio::time::timeout(OWNER_WAIT, wait_for_owner(&slack))
-                .await
-                .context("no message arrived within 10 minutes; run `prbot setup` again")??;
+            let id = find_owner(&slack, claude_email.as_deref(), &app_name, joined).await?;
             env.set("SLACK_OWNER_ID", &id);
             env.save()?;
             id
@@ -163,9 +181,211 @@ pub async fn setup(http: &Client) -> Result<()> {
     };
     println!("✓ Slack member ID: {owner}");
 
-    println!("\nDone. Settings are in {}.", path.display());
-    println!("Start the bot with `prbot`, then send /prreview help in Slack. `prbot doctor` re-checks everything.");
+    heading("5/5 Start");
+    if cfg!(windows) {
+        if confirm("Start prbot now and every time you log in?", true) {
+            lifecycle::autostart(true)?;
+            if lifecycle::is_running() {
+                println!("Restarting the running prbot with the new settings…");
+                lifecycle::stop().await?;
+            }
+            lifecycle::start_in_background()?;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if lifecycle::is_running() {
+                println!("✓ prbot is running in the background and starts when you log in (`prbot autostart off` undoes that).");
+            } else {
+                println!("✗ prbot didn't stay running; see {}", config::home_dir().join("prbot.log").display());
+            }
+        } else {
+            println!("Start it yourself with `prbot`.");
+        }
+    } else {
+        println!("Start it with `prbot`. To start it at login, see \"Run at login\" in {}.", env!("CARGO_PKG_REPOSITORY"));
+    }
+
+    println!("\nDone. In Slack, send /prreview help to the app. `prbot doctor` re-checks everything.");
     Ok(())
+}
+
+/// Finds the owner's Slack account: by email first (from Claude Code or git), else by asking.
+async fn find_owner(slack: &Slack, claude_email: Option<&str>, app_name: &str, joined: bool) -> Result<String> {
+    let git_email = Command::new("git")
+        .args(["config", "--global", "user.email"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.contains('@') && !s.ends_with("users.noreply.github.com"));
+    let mut emails: Vec<String> = claude_email.into_iter().map(String::from).chain(git_email).collect();
+    emails.dedup();
+    let mut can_lookup = true;
+    for email in &emails {
+        match slack.lookup_by_email(email).await {
+            Ok(Some((id, name))) => {
+                if confirm(&format!("Are you {name} ({email}) in Slack?"), true) {
+                    return greet(slack, id).await;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                println!("(Can't find you by email: {e:#}. The Slack app needs the users:read.email scope for that.)");
+                can_lookup = false;
+                break;
+            }
+        }
+    }
+    if can_lookup {
+        loop {
+            let email = ask("Your Slack email address (Enter to skip)", "");
+            if email.is_empty() {
+                break;
+            }
+            match slack.lookup_by_email(&email).await? {
+                Some((id, name)) => {
+                    println!("Found {name}.");
+                    return greet(slack, id).await;
+                }
+                None => println!("No Slack user has that email."),
+            }
+        }
+    } else if !joined && !lifecycle::is_running() {
+        // A new app of your own that can't look up emails: no other prbot is connected to it, so the
+        // first DM to the bot comes to us and identifies you.
+        println!("Open Slack, find \"{app_name}\" under Apps (or search for it) and send it any message.");
+        println!("Waiting…");
+        if let Ok(id) = tokio::time::timeout(OWNER_WAIT, wait_for_owner(slack)).await {
+            return id;
+        }
+    }
+    println!("In Slack, click your profile picture, then Profile, then the ⋮ button, then Copy member ID.");
+    loop {
+        let id = ask("Paste your member ID (U…)", "");
+        if (id.starts_with('U') || id.starts_with('W')) && slack.open_dm(&id).await.is_ok() {
+            return greet(slack, id).await;
+        }
+        println!("That isn't a member ID Slack knows.");
+    }
+}
+
+async fn greet(slack: &Slack, id: String) -> Result<String> {
+    let dm = slack.open_dm(&id).await?;
+    slack.post(&dm, "prbot is set up for you. Try `/prreview help`.", None, None).await?;
+    Ok(id)
+}
+
+/// On Windows, offers to install a missing `gh` or `claude`; elsewhere explains how.
+fn ensure_installed(bin: &str) -> Result<()> {
+    if has_cli(bin) || find_known_install(bin) {
+        return Ok(());
+    }
+    let (name, url) = match bin {
+        "gh" => ("GitHub CLI", "https://cli.github.com"),
+        _ => ("Claude Code", "https://claude.com/claude-code"),
+    };
+    if !cfg!(windows) {
+        bail!("{name} (`{bin}`) is not installed. Install it from {url}, then run `prbot setup` again.");
+    }
+    if !confirm(&format!("{name} is not installed. Install it now?"), true) {
+        bail!("{name} is needed. Install it from {url}, then run `prbot setup` again.");
+    }
+    let status = match bin {
+        "gh" => Command::new("winget")
+            .args(["install", "--id", "GitHub.cli", "-e", "--source", "winget", "--accept-package-agreements", "--accept-source-agreements"])
+            .status(),
+        _ => Command::new("powershell")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm https://claude.ai/install.ps1 | iex"])
+            .status(),
+    }
+    .with_context(|| format!("could not run the {name} installer"))?;
+    if !status.success() || !(has_cli(bin) || find_known_install(bin)) {
+        bail!("installing {name} didn't work. Install it from {url}, then run `prbot setup` again.");
+    }
+    println!("✓ {name} installed.");
+    Ok(())
+}
+
+/// Installers update PATH only for new terminals, so look where they put the program and add that
+/// folder to this process's PATH (a prbot started from setup inherits it).
+fn find_known_install(bin: &str) -> bool {
+    let env_dir = |name: &str| std::env::var_os(name).map(PathBuf::from);
+    let candidates: Vec<PathBuf> = match bin {
+        "gh" => [env_dir("ProgramFiles"), env_dir("LOCALAPPDATA").map(|d| d.join("Programs"))]
+            .into_iter()
+            .flatten()
+            .map(|d| d.join("GitHub CLI"))
+            .collect(),
+        _ => env_dir("USERPROFILE").map(|d| d.join(".local").join("bin")).into_iter().collect(),
+    };
+    for dir in candidates {
+        if dir.join(format!("{bin}.exe")).is_file() {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+            dirs.push(dir);
+            if let Ok(joined) = std::env::join_paths(dirs) {
+                std::env::set_var("PATH", joined);
+            }
+            return has_cli(bin);
+        }
+    }
+    false
+}
+
+/// `prbot invite`: a message with the team code, for a teammate.
+pub fn invite() -> Result<()> {
+    let bot = var("SLACK_BOT_TOKEN")?;
+    let app = var("SLACK_APP_TOKEN")?;
+    let message = format!(
+        "Set up prbot (Claude reviews the PRs that request your review) in about a minute:\r\n\
+         1. In PowerShell, run:  irm https://raw.githubusercontent.com/al-noori/prbot/main/install.ps1 | iex\r\n   \
+         (macOS or Linux: see {})\r\n\
+         2. When it asks for a team code, paste:  {}\r\n",
+        env!("CARGO_PKG_REPOSITORY"),
+        encode_team_code(&bot, &app)
+    );
+    println!("Send this to your teammate privately. The team code contains the Slack app's tokens: anyone who has it can read the bot's DMs and post as the bot.\n");
+    println!("{message}");
+    if cfg!(windows) {
+        let copied = Command::new("clip")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child.stdin.take().expect("piped").write_all(message.as_bytes())?;
+                child.wait()
+            })
+            .is_ok_and(|s| s.success());
+        if copied {
+            println!("(Copied to the clipboard.)");
+        }
+    }
+    Ok(())
+}
+
+const TEAM_CODE_PREFIX: &str = "prbot1-";
+
+fn encode_team_code(bot: &str, app: &str) -> String {
+    let json = json!({ "b": bot, "a": app }).to_string();
+    let hex: String = json.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("{TEAM_CODE_PREFIX}{hex}")
+}
+
+fn decode_team_code(code: &str) -> Result<(String, String)> {
+    let damaged = "the team code is damaged (copy it again)";
+    let hex: String = code
+        .trim()
+        .strip_prefix(TEAM_CODE_PREFIX)
+        .context("that isn't a prbot team code")?
+        .split_whitespace()
+        .collect();
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|i| hex.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
+        .collect::<Option<Vec<u8>>>()
+        .context(damaged)?;
+    let v: Value = serde_json::from_slice(&bytes).context(damaged)?;
+    match (v["b"].as_str(), v["a"].as_str()) {
+        (Some(b), Some(a)) => Ok((b.to_string(), a.to_string())),
+        _ => bail!(damaged),
+    }
 }
 
 pub async fn doctor(http: &Client) -> Result<()> {
@@ -241,6 +461,13 @@ fn check_claude_cli(bin: &str) -> Result<String> {
     Ok(who)
 }
 
+/// The email of the Claude Code login, used to find the owner in Slack.
+fn cli_email(bin: &str) -> Option<String> {
+    let out = Command::new(bin).args(["auth", "status", "--json"]).output().ok()?;
+    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    v["email"].as_str().map(String::from)
+}
+
 /// The model and effort reviews use (Slack choice in the state file, else CLAUDE_MODEL / CLAUDE_EFFORT, else defaults).
 fn configured_settings() -> Settings {
     Store::load(config::state_path()).map(|s| s.get().settings()).unwrap_or_else(|_| State::default().settings())
@@ -271,7 +498,11 @@ async fn check_bot_token(slack: &Slack) -> Result<String> {
             missing.join(", ")
         );
     }
-    Ok(format!("workspace {}, bot @{}", v["team"].as_str().unwrap_or("?"), v["user"].as_str().unwrap_or("?")))
+    let mut ok = format!("workspace {}, bot @{}", v["team"].as_str().unwrap_or("?"), v["user"].as_str().unwrap_or("?"));
+    if !scopes.iter().any(|s| s == "users:read.email") {
+        ok.push_str(". Tip: add the scopes users:read and users:read.email to the app and reinstall it, so teammates' setup finds them by email");
+    }
+    Ok(ok)
 }
 
 /// Checks both Slack tokens and returns the workspace name.
@@ -475,6 +706,15 @@ mod tests {
         assert_eq!(m["display_information"]["name"], "Ada's Reviewer");
         assert_eq!(m["features"]["bot_user"]["display_name"], "Ada's Reviewer");
         assert_eq!(m["settings"]["socket_mode_enabled"], true);
+    }
+
+    #[test]
+    fn team_code_round_trips() {
+        let code = encode_team_code("xoxb-1-abc", "xapp-1-A1-def");
+        assert_eq!(decode_team_code(&format!("  {code}
+")).unwrap(), ("xoxb-1-abc".into(), "xapp-1-A1-def".into()));
+        assert!(decode_team_code("prbot1-zz").is_err());
+        assert!(decode_team_code("hello").is_err());
     }
 
     #[test]

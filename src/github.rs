@@ -1,7 +1,7 @@
 //! Minimal GitHub REST client.
 //!
 //! By design there is no function here to approve, request changes, or merge:
-//! the writes are `post_review` (always event "COMMENT"), `comment`, and `reply_to_review_comment`.
+//! the writes are `post_review` (always event "COMMENT"), `comment`, `reply_to_review_comment` and reactions.
 
 use crate::review::InlineComment;
 use chrono::{DateTime, Utc};
@@ -252,6 +252,20 @@ impl GitHub {
             .await?;
         let v: Value = ok(resp).await?.json().await?;
         Ok(s(&v["html_url"]))
+    }
+
+    /// Adds a reaction such as "+1" to a review comment.
+    pub async fn react_to_review_comment(&self, pr: &PrRef, comment_id: u64, content: &str) -> Result<()> {
+        let url = format!("{API}/repos/{}/{}/pulls/comments/{comment_id}/reactions", pr.owner, pr.repo);
+        let resp = self.req(Method::POST, url, "application/vnd.github+json").json(&json!({ "content": content })).send().await?;
+        ok(resp).await.map(|_| ())
+    }
+
+    /// Adds a reaction such as "+1" to a conversation comment.
+    pub async fn react_to_issue_comment(&self, pr: &PrRef, comment_id: u64, content: &str) -> Result<()> {
+        let url = format!("{API}/repos/{}/{}/issues/comments/{comment_id}/reactions", pr.owner, pr.repo);
+        let resp = self.req(Method::POST, url, "application/vnd.github+json").json(&json!({ "content": content })).send().await?;
+        ok(resp).await.map(|_| ())
     }
 
     /// Adds a conversation comment to the PR. Returns its URL.
