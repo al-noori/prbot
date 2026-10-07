@@ -92,8 +92,15 @@ pub async fn setup(http: &Client) -> Result<()> {
         None => false,
     };
     if !app_ok && bot_token.is_none() {
-        println!("If your team already uses prbot, paste the team code a teammate sent you (they get it with `prbot invite`).");
-        let code = secret("Team code, or press Enter to create your own Slack app instead")?;
+        if var("PRBOT_TEAM_CODE").is_err() {
+            println!("If your team already uses prbot, open the PR Reviewer app's Home tab in Slack and use the setup line there,");
+            println!("or paste the team code a teammate sent you (`prbot invite`).");
+        }
+        // The setup line from the app's Home tab passes the code along, so there's nothing to paste.
+        let code = match var("PRBOT_TEAM_CODE") {
+            Ok(code) => code,
+            Err(_) => secret("Team code, or press Enter to create your own Slack app instead")?,
+        };
         if !code.is_empty() {
             let (bot, app) = decode_team_code(&code)?;
             let team = check_slack(http, &bot, &app).await.context("the team code doesn't work (ask for a fresh one)")?;
@@ -330,17 +337,24 @@ fn find_known_install(bin: &str) -> bool {
     false
 }
 
-/// `prbot invite`: a message with the team code, for a teammate.
+/// This app's team code: its Slack tokens, for joining it.
+pub fn team_code() -> Result<String> {
+    Ok(encode_team_code(&var("SLACK_BOT_TOKEN")?, &var("SLACK_APP_TOKEN")?))
+}
+
+/// The PowerShell line that installs prbot and joins this app.
+pub fn setup_line() -> Result<String> {
+    Ok(format!("$env:PRBOT_TEAM_CODE='{}'; irm https://raw.githubusercontent.com/al-noori/prbot/main/install.ps1 | iex", team_code()?))
+}
+
+/// `prbot invite`: a message with the setup line, for a teammate.
 pub fn invite() -> Result<()> {
-    let bot = var("SLACK_BOT_TOKEN")?;
-    let app = var("SLACK_APP_TOKEN")?;
     let message = format!(
         "Set up prbot (Claude reviews the PRs that request your review) in about a minute:\r\n\
-         1. In PowerShell, run:  irm https://raw.githubusercontent.com/al-noori/prbot/main/install.ps1 | iex\r\n   \
-         (macOS or Linux: see {})\r\n\
-         2. When it asks for a team code, paste:  {}\r\n",
-        env!("CARGO_PKG_REPOSITORY"),
-        encode_team_code(&bot, &app)
+         open PowerShell, paste this line and press Enter:\r\n\r\n{}\r\n\r\n\
+         (macOS or Linux: see {})\r\n",
+        setup_line()?,
+        env!("CARGO_PKG_REPOSITORY")
     );
     println!("Send this to your teammate privately. The team code contains the Slack app's tokens: anyone who has it can read the bot's DMs and post as the bot.\n");
     println!("{message}");
