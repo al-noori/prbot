@@ -34,7 +34,9 @@ It runs on your own machine with your own accounts: GitHub through the `gh` CLI,
 
 5. **Start it with `prbot`**, then send `/prreview help` in Slack. Checks start **off**; turn them on with `/prreview on`.
 
-`prbot doctor` checks the configuration and every connection.
+`prbot doctor` checks the configuration and every connection. `prbot status` tells you whether the bot is running, and `prbot stop` stops it. Only one copy runs per configuration, because a second copy would take half of Slack's events.
+
+**Is it running?** Look at the bot's Home tab in Slack, not the green dot next to its name. Slack doesn't let apps control that dot, so it stays green either way. The Home tab says "running since …" and refreshes every 5 minutes. When prbot stops (`prbot stop`, Ctrl+C, closing its window, or SIGTERM), the tab switches to "stopped". If the computer shuts down or the process is killed, the tab can't update, but its "updated" time stops moving.
 
 Settings are saved to `%APPDATA%\prbot\.env` on Windows or `~/.config/prbot/.env` on macOS and Linux. A `.env` in the current directory takes precedence, and `PRBOT_HOME` overrides both. The state file and `prbot.log` are saved next to it.
 
@@ -66,7 +68,7 @@ With `/prreview followup on`, prbot keeps an eye on every PR it has posted a rev
 - **New commits** get a re-review right away. Claude sees its previous review, says which findings are fixed and focuses on what changed.
 - **Replies** to Claude's inline comments, and PR comments that @mention you, get an answer from Claude in the same thread, marked as written by Claude and not reviewed by you. If the reply is just a thanks, or meant for someone else, Claude doesn't answer.
 
-Comments by bots and by you are never answered, and neither is a comment you've already replied to yourself. Each PR gets at most 5 replies a day. A PR stops being followed when it's closed or merged, or after 14 days without activity. Every re-review and reply also shows up as a short message in Slack.
+Comments by bots and by you are never answered, and neither is a comment you've already replied to yourself. Each PR gets at most 5 replies a day. Reviews posted before follow-ups were turned on are followed too, starting from the time they were posted. A PR stops being followed when it's closed or merged, or after 14 days without activity. Every re-review and reply also shows up as a short message in Slack.
 
 ## For teammates
 
@@ -84,7 +86,7 @@ $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut("$([Environment]::Ge
 $lnk.TargetPath = "conhost.exe"; $lnk.Arguments = "--headless `"$exe`""; $lnk.Save()
 ```
 
-To stop prbot, run `Stop-Process -Name prbot`. To remove it from login, delete `prbot.lnk` from the Startup folder (`shell:startup`).
+To stop prbot, run `prbot stop` (`Stop-Process -Name prbot` works too, but then the Home tab can't switch to "stopped"). To remove it from login, delete `prbot.lnk` from the Startup folder (`shell:startup`).
 
 **macOS:** run this from a terminal where `gh` and `claude` work, so the agent gets the same `PATH`:
 
