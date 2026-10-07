@@ -3,7 +3,9 @@ use std::{env, path::PathBuf, process::Command};
 
 /// Settings needed for reviewing (CLI and bot).
 pub struct Config {
-    pub anthropic_api_key: String,
+    /// When unset, reviews run through the Claude Code CLI instead of the API.
+    pub anthropic_api_key: Option<String>,
+    pub claude_bin: String,
     pub github_token: String,
     pub state_path: PathBuf,
     pub max_reviews_per_run: usize,
@@ -31,7 +33,8 @@ impl Config {
             _ => gh_cli_token()?,
         };
         Ok(Self {
-            anthropic_api_key: var("ANTHROPIC_API_KEY")?,
+            anthropic_api_key: var("ANTHROPIC_API_KEY").ok(),
+            claude_bin: var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
             github_token,
             state_path: env::var("PRBOT_STATE")
                 .map(PathBuf::from)

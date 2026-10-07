@@ -50,12 +50,16 @@ pub struct Review {
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// `None` when the review ran on a Claude subscription through Claude Code.
+    pub cost_usd: Option<f64>,
 }
 
 impl Review {
-    /// Rough cost at Opus 5.5 list prices ($4 / $20 per million tokens).
-    pub fn approx_cost_usd(&self) -> f64 {
-        self.input_tokens as f64 * 4.0 / 1e6 + self.output_tokens as f64 * 20.0 / 1e6
+    pub fn cost_label(&self) -> String {
+        match self.cost_usd {
+            Some(c) => format!("~${c:.2}"),
+            None => "via Claude Code".into(),
+        }
     }
 }
 
@@ -119,6 +123,7 @@ pub async fn run(gh: &GitHub, claude: &Claude, pr: &PrRef) -> Result<Review> {
         model: c.model,
         input_tokens: c.input_tokens,
         output_tokens: c.output_tokens,
+        cost_usd: c.cost_usd,
     })
 }
 

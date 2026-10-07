@@ -28,19 +28,22 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(120))
         .build()?;
     let gh = GitHub::new(http.clone(), cfg.github_token.clone());
-    let claude = Claude::new(http.clone(), cfg.anthropic_api_key.clone());
+    let claude = match &cfg.anthropic_api_key {
+        Some(key) => Claude::api(http.clone(), key.clone()),
+        None => Claude::cli(cfg.claude_bin.clone()),
+    };
 
     // `prbot review <url>`: one review printed to the terminal, no Slack needed.
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("review") {
         let pr = args.get(2).and_then(|a| PrRef::parse(a)).context("usage: prbot review <GitHub PR URL>")?;
-        eprintln!("Reviewing {} with {} (effort {})…", pr.key(), claude::MODEL, claude::EFFORT);
+        eprintln!("Reviewing {} with {} (effort {}) via {}…", pr.key(), claude::MODEL, claude::EFFORT, claude.describe());
         let r = review::run(&gh, &claude, &pr).await?;
         println!("Verdict: {}\n\n{}", r.verdict, r.body);
         for note in &r.notes {
             eprintln!("note: {note}");
         }
-        eprintln!("{} · {} in / {} out tokens · ~${:.2}", r.model, r.input_tokens, r.output_tokens, r.approx_cost_usd());
+        eprintln!("{} · {} in / {} out tokens · {}", r.model, r.input_tokens, r.output_tokens, r.cost_label());
         return Ok(());
     }
 

@@ -233,7 +233,7 @@ impl Bot {
         let next = *self.next_run.lock().unwrap();
         let in_flight = self.in_flight.lock().unwrap().len();
         format!(
-            "*Scheduled checks:* {}\n*Schedule:* {}{}\n*Next check:* {}\n*Last check:* {}\n*Scope:* {}\n*Model:* `{}`, effort `{}`\n*Reviews running:* {}",
+            "*Scheduled checks:* {}\n*Schedule:* {}{}\n*Next check:* {}\n*Last check:* {}\n*Scope:* {}\n*Model:* `{}`, effort `{}`, via {}\n*Reviews running:* {}",
             if st.enabled { ":large_green_circle: on" } else { ":white_circle: off" },
             st.schedule.describe(),
             if st.weekdays_only { " (weekdays only)" } else { "" },
@@ -242,6 +242,7 @@ impl Bot {
             scope_label(&st.query),
             claude::MODEL,
             claude::EFFORT,
+            self.claude.describe(),
             in_flight,
         )
     }
@@ -489,8 +490,8 @@ fn header_blocks(r: &Review, id: &str) -> (String, Value) {
         json!({ "type": "section", "text": { "type": "mrkdwn", "text": format!(
             "*<{}|{}>* {}\n*Verdict:* {}", r.pr.url(), r.pr.key(), slack::esc(&i.title), slack::esc(&r.verdict)) } }),
         json!({ "type": "context", "elements": [{ "type": "mrkdwn", "text": format!(
-            "by {} · +{} −{} in {} files · `{}` effort {} · ~${:.2} · full review in the thread",
-            slack::esc(&i.author), i.additions, i.deletions, i.changed_files, r.model, claude::EFFORT, r.approx_cost_usd()) }] }),
+            "by {} · +{} −{} in {} files · `{}` effort {} · {} · full review in the thread",
+            slack::esc(&i.author), i.additions, i.deletions, i.changed_files, r.model, claude::EFFORT, r.cost_label()) }] }),
     ];
     if !r.notes.is_empty() {
         let notes: String = slack::esc(&r.notes.join(" ")).chars().take(2800).collect();
