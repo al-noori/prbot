@@ -56,6 +56,8 @@ Settings are saved to `%APPDATA%\prbot\.env` on Windows or `~/.config/prbot/.env
 | `/prreview model opus\|sonnet\|haiku\|fable` | Choose the Claude model (or give a full model ID) |
 | `/prreview effort low\|medium\|high\|xhigh\|max` | How hard Claude thinks (Haiku has no effort setting) |
 | `/prreview scope me\|team` | Only PRs requesting you directly, or also through your teams |
+| `/prreview list` | Post the overview of your PRs now |
+| `/prreview done <PR URL>` / `reopen <PR URL>` | Mark a PR as reviewed by you (stops follow-ups), or undo that |
 | `/prreview <PR URL>` | Review that PR now (or just DM the bot the link) |
 
 The Home tab has the same controls: on/off, check now, schedule, model, effort and follow-ups.
@@ -67,9 +69,19 @@ To review a PR in the terminal without Slack, run `prbot review https://github.c
 With `/prreview followup on`, prbot keeps an eye on every PR it has posted a review on. It checks every 2 minutes, within your working hours:
 
 - **New commits** get a re-review right away. Claude sees its previous review, says which findings are fixed and focuses on what changed.
-- **Replies** to Claude's inline comments, and PR comments that @mention you, get an answer from Claude in the same thread, marked as written by Claude and not reviewed by you. If the reply is just a thanks, or meant for someone else, Claude doesn't answer.
+- **Replies** to Claude's inline comments, and PR comments that @mention you, get an answer from Claude in the same thread, marked as written by Claude and not reviewed by you. If a comment needs no answer (a thanks, an acknowledgement, or something meant for someone else), Claude gives it a 👍 instead.
 
 Comments by bots and by you are never answered, and neither is a comment you've already replied to yourself. Each PR gets at most 5 replies a day. Reviews posted before follow-ups were turned on are followed too, starting from the time they were posted. A PR stops being followed when it's closed or merged, or after 14 days without activity. Every re-review and reply also shows up as a short message in Slack.
+
+## Overview of your PRs
+
+Every scheduled check (and `/prreview list`) posts one message listing the PRs on your plate: the ones requesting your review, the ones Claude reviewed and is following, and the ones you marked done.
+
+- ⏳ **waiting:** not reviewed yet (a draft, or the per-check limit was reached)
+- 🔄 **in work:** Claude is reviewing it, or reviewed it and the author is on it
+- ✅ **done:** you marked it as reviewed from your side
+
+Each row has a ⋯ menu. **Details** answers in the thread with the PR's state, CI checks, Claude's last review and verdict, new commits since then, the discussion, and other reviewers' verdicts. **Mark done** tells prbot you're finished with the PR: it shows ✅ and Claude stops following it. If the author pushes new commits and requests your review again, the PR is no longer marked done and gets reviewed as usual. **Reopen** undoes Mark done. Merged and closed PRs drop off the list.
 
 ## Teams: one Slack app for everyone
 

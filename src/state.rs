@@ -146,6 +146,8 @@ pub struct State {
     pub followup: bool,
     /// "owner/repo#123" -> follow-up state.
     pub watched: HashMap<String, Watch>,
+    /// "owner/repo#123" -> head commit when you marked the PR done. Done PRs aren't followed.
+    pub done: HashMap<String, String>,
 }
 
 impl Default for State {
@@ -164,6 +166,7 @@ impl Default for State {
             effort: None,
             followup: false,
             watched: HashMap::new(),
+            done: HashMap::new(),
         }
     }
 }

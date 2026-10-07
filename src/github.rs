@@ -30,6 +30,13 @@ impl PrRef {
         Some(Self { owner: c[1].to_string(), repo: c[2].to_string(), number: c[3].parse().ok()? })
     }
 
+    /// Parses "owner/repo#123".
+    pub fn parse_key(key: &str) -> Option<Self> {
+        let (repo, number) = key.trim().split_once('#')?;
+        let (owner, repo) = repo.split_once('/')?;
+        Some(Self { owner: owner.to_string(), repo: repo.to_string(), number: number.parse().ok()? })
+    }
+
     pub fn key(&self) -> String {
         format!("{}/{}#{}", self.owner, self.repo, self.number)
     }
@@ -53,6 +60,10 @@ pub struct PrInfo {
     pub base_ref: String,
     pub draft: bool,
     pub open: bool,
+    pub merged: bool,
+    /// GitHub's mergeable_state: clean, blocked, behind, dirty, unstable, …
+    pub mergeable_state: String,
+    pub updated: DateTime<Utc>,
     pub additions: u64,
     pub deletions: u64,
     pub changed_files: u64,
@@ -165,6 +176,9 @@ impl GitHub {
             base_ref: s(&v["base"]["ref"]),
             draft: v["draft"].as_bool().unwrap_or(false),
             open: v["state"] == "open",
+            merged: v["merged"].as_bool().unwrap_or(false),
+            mergeable_state: s(&v["mergeable_state"]),
+            updated: v["updated_at"].as_str().and_then(|t| t.parse().ok()).unwrap_or_default(),
             additions: v["additions"].as_u64().unwrap_or(0),
             deletions: v["deletions"].as_u64().unwrap_or(0),
             changed_files: v["changed_files"].as_u64().unwrap_or(0),
@@ -252,6 +266,52 @@ impl GitHub {
             .await?;
         let v: Value = ok(resp).await?.json().await?;
         Ok(s(&v["html_url"]))
+    }
+
+    /// "12 passed, 1 failed (build), 2 running" for the check runs on `sha`.
+    pub async fn checks_summary(&self, pr: &PrRef, sha: &str) -> Result<String> {
+        let v = self
+            .get_json(&format!("{API}/repos/{}/{}/commits/{sha}/check-runs?per_page=100", pr.owner, pr.repo))
+            .await?;
+        let runs = v["check_runs"].as_array().cloned().unwrap_or_default();
+        if runs.is_empty() {
+            return Ok("none".into());
+        }
+        let (mut passed, mut running, mut failed) = (0, 0, Vec::new());
+        for r in &runs {
+            match (r["status"].as_str(), r["conclusion"].as_str()) {
+                (Some("completed"), Some("success" | "neutral" | "skipped")) => passed += 1,
+                (Some("completed"), _) => failed.push(s(&r["name"])),
+                _ => running += 1,
+            }
+        }
+        let mut parts = vec![format!("{passed} passed")];
+        if !failed.is_empty() {
+            parts.push(format!("{} failed ({})", failed.len(), failed.join(", ")));
+        }
+        if running > 0 {
+            parts.push(format!("{running} running"));
+        }
+        Ok(parts.join(", "))
+    }
+
+    /// Commits from `base` to `head`: how many, and their first lines (newest last).
+    pub async fn compare(&self, pr: &PrRef, base: &str, head: &str) -> Result<(u64, Vec<String>)> {
+        let v = self.get_json(&format!("{API}/repos/{}/{}/compare/{base}...{head}", pr.owner, pr.repo)).await?;
+        let messages = v["commits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c["commit"]["message"].as_str())
+            .map(|m| m.lines().next().unwrap_or_default().to_string())
+            .collect();
+        Ok((v["ahead_by"].as_u64().unwrap_or(0), messages))
+    }
+
+    /// (reviewer, state) for each submitted review, oldest first.
+    pub async fn reviews(&self, pr: &PrRef) -> Result<Vec<(String, String)>> {
+        let v = self.get_json(&pr.api("/reviews?per_page=100")).await?;
+        Ok(v.as_array().into_iter().flatten().map(|r| (s(&r["user"]["login"]), s(&r["state"]))).collect())
     }
 
     /// Adds a reaction such as "+1" to a review comment.
