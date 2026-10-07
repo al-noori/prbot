@@ -2,6 +2,7 @@
 name = "prbot"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
 repository = "https://github.com/al-noori/prbot"
 description = "Slack bot that reviews GitHub PRs requesting your review with Claude. Never approves or merges."
 

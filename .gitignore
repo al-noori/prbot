@@ -3,3 +3,5 @@
 prbot-state.json
 prbot-state.json.tmp
 prbot.log
+prbot.lock
+prbot.stop

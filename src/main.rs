@@ -3,6 +3,7 @@ mod claude;
 mod config;
 mod followup;
 mod github;
+mod lifecycle;
 mod review;
 mod setup;
 mod slack;
@@ -26,6 +27,8 @@ Usage:
   prbot                 run the Slack bot
   prbot setup           set up GitHub, Claude and the Slack app (writes .env)
   prbot doctor          check the configuration and connections
+  prbot status          show whether the bot is running
+  prbot stop            stop the running bot (Slack then shows it as stopped)
   prbot review <url>    review one PR and print it, without Slack
   prbot --version";
 
@@ -53,6 +56,11 @@ async fn main() -> Result<()> {
         Some("setup") => return setup::setup(&http).await,
         Some("doctor") => return setup::doctor(&http).await,
         Some("review") => return review_once(&http, args.get(2)).await,
+        Some("stop") => return lifecycle::stop().await,
+        Some("status") => {
+            println!("prbot is {}.", if lifecycle::is_running() { "running" } else { "not running" });
+            return Ok(());
+        }
         Some("-V" | "--version" | "version") => {
             println!("prbot {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
@@ -69,6 +77,7 @@ async fn main() -> Result<()> {
     }
     let cfg = Config::from_env()?;
     let sc = SlackConfig::from_env()?;
+    let _lock = lifecycle::acquire()?;
     let gh = GitHub::new(http.clone(), cfg.github_token.clone());
     let claude = make_claude(&http, &cfg);
     let slack = Slack::new(http.clone(), sc.bot_token, sc.app_token);
@@ -92,10 +101,22 @@ async fn main() -> Result<()> {
     bot.refresh_home().await;
     tokio::spawn(bot.clone().run_scheduler());
     tokio::spawn(bot.clone().run_followups());
+    tokio::spawn(bot.clone().run_heartbeat());
     log(&format!("prbot running for GitHub @{}\n{}", bot.gh_login, bot.status_text()));
 
+    let reason = tokio::select! {
+        r = lifecycle::shutdown_signal() => r,
+        _ = socket_loop(&bot) => "Socket Mode loop ended",
+    };
+    log(&format!("stopping ({reason})"));
+    bot.show_stopped(reason).await;
+    Ok(())
+}
+
+/// Keeps a Socket Mode connection open, reconnecting whenever it drops.
+async fn socket_loop(bot: &Arc<Bot>) {
     loop {
-        match socket_session(&bot).await {
+        match socket_session(bot).await {
             Ok(()) => log("Socket Mode connection closed; reconnecting"),
             Err(e) => log(&format!("Socket Mode error: {e:#}; reconnecting in 5 s")),
         }

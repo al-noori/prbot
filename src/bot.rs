@@ -40,6 +40,9 @@ pub struct Bot {
     pub gh_login: String,
     /// DM channel with the owner, where everything is posted.
     pub dm: String,
+    /// When this process started, and on which computer (shown on the Home tab).
+    started: DateTime<Local>,
+    host: String,
     next_run: Mutex<Option<DateTime<Local>>>,
     in_flight: Mutex<HashSet<String>>,
     workers: Semaphore,
@@ -57,6 +60,8 @@ impl Bot {
             store,
             gh_login,
             dm,
+            started: Local::now(),
+            host: std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "this computer".into()),
             next_run: Mutex::new(None),
             in_flight: Mutex::new(HashSet::new()),
             workers: Semaphore::new(PARALLEL_REVIEWS),
@@ -323,7 +328,11 @@ impl Bot {
         let next = *self.next_run.lock().unwrap();
         let in_flight = self.in_flight.lock().unwrap().len();
         format!(
-            "*Scheduled checks:* {}\n*Schedule:* {}, {}\n*Next check:* {}\n*Last check:* {}\n*Posting:* {}\n*Follow-ups:* {}\n*Scope:* {}\n*Model:* {} via {}\n*Reviews running:* {}",
+            "*prbot:* :large_green_circle: running on {} since {} (v{}), updated {}\n*Scheduled checks:* {}\n*Schedule:* {}, {}\n*Next check:* {}\n*Last check:* {}\n*Posting:* {}\n*Follow-ups:* {}\n*Scope:* {}\n*Model:* {} via {}\n*Reviews running:* {}",
+            self.host,
+            fmt_time(self.started),
+            env!("CARGO_PKG_VERSION"),
+            Local::now().format("%H:%M"),
             if st.enabled { ":large_green_circle: on" } else { ":white_circle: off" },
             st.schedule.describe(),
             st.window().describe(),
@@ -550,6 +559,33 @@ impl Bot {
     }
 
     // ---------- App Home tab ----------
+
+    /// Republishes the Home tab every 5 minutes, so its "updated" time shows the bot is alive even
+    /// when it was stopped without a chance to say so (killed, crashed, computer shut down).
+    pub async fn run_heartbeat(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            self.refresh_home().await;
+        }
+    }
+
+    /// Replaces the Home tab with a "stopped" notice on shutdown. Its buttons wouldn't work anymore.
+    pub async fn show_stopped(&self, reason: &str) {
+        let text = format!(
+            ":red_circle: *prbot is stopped* (since {}, {reason}).\nIt was running on {}. Until it's started again with `prbot`, nothing gets reviewed and `/prreview` doesn't answer.",
+            fmt_time(Local::now()),
+            self.host
+        );
+        let view = json!({ "type": "home", "blocks": [
+            { "type": "header", "text": { "type": "plain_text", "text": "PR Reviewer" } },
+            { "type": "section", "text": { "type": "mrkdwn", "text": text } }
+        ] });
+        if let Err(e) = self.slack.publish_home(&self.owner, view).await {
+            crate::log(&format!("could not mark the Home tab as stopped: {e:#}"));
+        }
+    }
 
     pub async fn refresh_home(&self) {
         let st = self.store.get();

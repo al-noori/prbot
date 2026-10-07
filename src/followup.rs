@@ -42,12 +42,53 @@ impl Bot {
             if !st.followup || !st.window().contains(&Local::now()) {
                 continue;
             }
-            for (key, watch) in st.watched {
+            if let Err(e) = self.adopt_posted_reviews() {
+                crate::log(&format!("could not pick up posted reviews: {e:#}"));
+            }
+            for (key, watch) in self.store.get().watched {
                 if let Err(e) = self.follow_up(&key, &watch).await {
                     crate::log(&format!("follow-up on {key} failed: {e:#}"));
                 }
             }
         }
+    }
+
+    /// Follows PRs whose review was posted but which aren't watched yet (reviews posted before
+    /// follow-ups existed, or while they were off). Comments since the review count as new.
+    fn adopt_posted_reviews(&self) -> Result<()> {
+        let st = self.store.get();
+        let mut latest: std::collections::HashMap<String, &crate::state::StoredReview> = Default::default();
+        for r in st.reviews.values().filter(|r| r.posted_url.is_some()) {
+            let Some(pr) = PrRef::parse(&r.pr_url) else { continue };
+            if st.watched.contains_key(&pr.key()) || Utc::now() - r.created > Duration::days(FOLLOW_DAYS) {
+                continue;
+            }
+            let entry = latest.entry(pr.key()).or_insert(r);
+            if r.created > entry.created {
+                *entry = r;
+            }
+        }
+        if latest.is_empty() {
+            return Ok(());
+        }
+        self.store.update(|s| {
+            for (key, r) in &latest {
+                s.watched.insert(
+                    key.clone(),
+                    Watch {
+                        pr_url: r.pr_url.clone(),
+                        reviewed_sha: r.head_sha.clone(),
+                        last_review: r.body.clone(),
+                        checked: r.created,
+                        handled: Vec::new(),
+                        replies: Vec::new(),
+                        active: r.created,
+                    },
+                );
+            }
+        })?;
+        crate::log(&format!("now following {} PR(s) with an earlier posted review", latest.len()));
+        Ok(())
     }
 
     /// Starts following a PR after its review was posted.
