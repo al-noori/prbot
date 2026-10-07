@@ -1,0 +1,41 @@
+{
+  "display_information": {
+    "name": "PR Reviewer",
+    "description": "Claude reviews the PRs that request your review. Never approves or merges."
+  },
+  "features": {
+    "app_home": {
+      "home_tab_enabled": true,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    },
+    "bot_user": {
+      "display_name": "PR Reviewer",
+      "always_online": true
+    },
+    "slash_commands": [
+      {
+        "command": "/prreview",
+        "description": "Claude PR reviews: on, off, status, now, every 1h, at 09:00, or a PR URL",
+        "usage_hint": "[on | off | status | now | every 2h | at 09:00,14:00 | <PR URL> | help]",
+        "should_escape": false
+      }
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": ["chat:write", "commands", "im:history", "im:write"]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": ["app_home_opened", "message.im"]
+    },
+    "interactivity": {
+      "is_enabled": true
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}

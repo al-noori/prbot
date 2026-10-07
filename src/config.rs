@@ -1,5 +1,9 @@
 use anyhow::{bail, Context, Result};
-use std::{env, path::PathBuf, process::Command};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 /// Settings needed for reviewing (CLI and bot).
 pub struct Config {
@@ -19,11 +23,44 @@ pub struct SlackConfig {
     pub owner_id: String,
 }
 
-fn var(name: &str) -> Result<String> {
+/// Directory holding `.env`, the state file and the log: `PRBOT_HOME`, else the current directory
+/// if it has a `.env`, else a per-user config directory (`%APPDATA%\prbot` or `~/.config/prbot`).
+pub fn home_dir() -> PathBuf {
+    if let Some(dir) = env::var_os("PRBOT_HOME").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if Path::new(".env").is_file() {
+        return PathBuf::from(".");
+    }
+    user_config_dir().join("prbot")
+}
+
+fn user_config_dir() -> PathBuf {
+    let from = |name: &str| env::var_os(name).filter(|d| !d.is_empty()).map(PathBuf::from);
+    if cfg!(windows) {
+        if let Some(dir) = from("APPDATA") {
+            return dir;
+        }
+    } else if let Some(dir) = from("XDG_CONFIG_HOME") {
+        return dir;
+    }
+    from("HOME").or_else(|| from("USERPROFILE")).unwrap_or_else(|| PathBuf::from(".")).join(".config")
+}
+
+pub fn env_path() -> PathBuf {
+    home_dir().join(".env")
+}
+
+/// Loads `.env` into the process environment. Variables that are already set win.
+pub fn load_env() {
+    dotenvy::from_path(env_path()).ok();
+}
+
+pub fn var(name: &str) -> Result<String> {
     env::var(name)
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .with_context(|| format!("missing env var {name} (see .env.example)"))
+        .with_context(|| format!("{name} is not set in {} (run `prbot setup`)", env_path().display()))
 }
 
 impl Config {
@@ -34,11 +71,11 @@ impl Config {
         };
         Ok(Self {
             anthropic_api_key: var("ANTHROPIC_API_KEY").ok(),
-            claude_bin: var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
+            claude_bin: claude_bin(),
             github_token,
             state_path: env::var("PRBOT_STATE")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("prbot-state.json")),
+                .unwrap_or_else(|_| home_dir().join("prbot-state.json")),
             max_reviews_per_run: env::var("MAX_REVIEWS_PER_RUN")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -58,15 +95,19 @@ impl SlackConfig {
     }
 }
 
+pub fn claude_bin() -> String {
+    var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into())
+}
+
 /// Falls back to the token of the logged-in GitHub CLI.
-fn gh_cli_token() -> Result<String> {
+pub fn gh_cli_token() -> Result<String> {
     let out = Command::new("gh")
         .args(["auth", "token"])
         .output()
-        .context("GITHUB_TOKEN is not set and the `gh` CLI was not found")?;
+        .context("GITHUB_TOKEN is not set and the GitHub CLI (`gh`) was not found. Install it from https://cli.github.com")?;
     if !out.status.success() {
         bail!(
-            "GITHUB_TOKEN is not set and `gh auth token` failed: {}",
+            "GITHUB_TOKEN is not set and `gh auth token` failed (run `gh auth login`): {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }

@@ -71,7 +71,7 @@ impl Bot {
             _ => Ok(()),
         };
         if let Err(e) = result {
-            eprintln!("error handling {kind}: {e:#}");
+            crate::log(&format!("error handling {kind}: {e:#}"));
             let _ = self.slack.post(&self.dm, &format!(":warning: {e:#}"), None, None).await;
         }
     }
@@ -524,7 +524,7 @@ impl Bot {
             ]
         });
         if let Err(e) = self.slack.publish_home(&self.owner, view).await {
-            eprintln!("could not update the Home tab: {e:#}");
+            crate::log(&format!("could not update the Home tab: {e:#}"));
         }
     }
 }

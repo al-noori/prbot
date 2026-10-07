@@ -49,6 +49,27 @@ impl Slack {
         v["url"].as_str().map(String::from).context("no Socket Mode URL returned")
     }
 
+    /// `auth.test` for the bot token, plus the scopes the token was granted.
+    pub async fn auth_test(&self) -> Result<(Value, Vec<String>)> {
+        let resp = self
+            .http
+            .post("https://slack.com/api/auth.test")
+            .bearer_auth(&self.bot_token)
+            .send()
+            .await?;
+        let scopes = resp
+            .headers()
+            .get("x-oauth-scopes")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+            .unwrap_or_default();
+        let v: Value = resp.json().await?;
+        if v["ok"].as_bool() != Some(true) {
+            bail!("Slack auth.test failed: {}", v["error"].as_str().unwrap_or("unknown error"));
+        }
+        Ok((v, scopes))
+    }
+
     pub async fn open_dm(&self, user: &str) -> Result<String> {
         let v = self.api("conversations.open", json!({ "users": user })).await?;
         v["channel"]["id"].as_str().map(String::from).context("conversations.open returned no channel")
