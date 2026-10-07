@@ -63,6 +63,10 @@ pub fn var(name: &str) -> Result<String> {
         .with_context(|| format!("{name} is not set in {} (run `prbot setup`)", env_path().display()))
 }
 
+pub fn state_path() -> PathBuf {
+    env::var("PRBOT_STATE").map(PathBuf::from).unwrap_or_else(|_| home_dir().join("prbot-state.json"))
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         let github_token = match env::var("GITHUB_TOKEN") {
@@ -73,9 +77,7 @@ impl Config {
             anthropic_api_key: var("ANTHROPIC_API_KEY").ok(),
             claude_bin: claude_bin(),
             github_token,
-            state_path: env::var("PRBOT_STATE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| home_dir().join("prbot-state.json")),
+            state_path: state_path(),
             max_reviews_per_run: env::var("MAX_REVIEWS_PER_RUN")
                 .ok()
                 .and_then(|v| v.parse().ok())

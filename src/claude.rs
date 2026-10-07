@@ -9,20 +9,77 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
-pub const MODEL: &str = "claude-opus-5-5";
-pub const EFFORT: &str = "medium";
+pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
+pub const DEFAULT_EFFORT: &str = "medium";
+pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+/// (shorthand, model ID, label): the models offered by `/prreview model` and on the Home tab.
+pub const MODELS: [(&str, &str, &str); 4] = [
+    ("opus", "claude-opus-5-5", "Opus 5.5"),
+    ("sonnet", "claude-sonnet-5-5", "Sonnet 5.5"),
+    ("haiku", "claude-haiku-4-5", "Haiku 4.5"),
+    ("fable", "claude-fable-5-1", "Fable 5.1"),
+];
 const MAX_TOKENS: u32 = 16_000;
 const MAX_ATTEMPTS: u32 = 4;
 const CLI_TIMEOUT: Duration = Duration::from_secs(1800);
 
+/// Which model reviews, and how hard it thinks.
+#[derive(Debug, Clone)]
+pub struct Settings {
+    pub model: String,
+    pub effort: String,
+}
+
+impl Settings {
+    /// Haiku 4.5 has no effort setting (and no adaptive thinking).
+    pub fn uses_effort(&self) -> bool {
+        !self.model.starts_with("claude-haiku")
+    }
+
+    pub fn describe(&self) -> String {
+        if self.uses_effort() {
+            format!("{}, effort {}", model_label(&self.model), self.effort)
+        } else {
+            model_label(&self.model).to_string()
+        }
+    }
+}
+
+/// "opus", "Sonnet", or a full `claude-…` model ID.
+pub fn resolve_model(s: &str) -> Option<String> {
+    let s = s.trim().to_lowercase();
+    if let Some((_, id, _)) = MODELS.iter().find(|(short, id, _)| *short == s || *id == s) {
+        return Some(id.to_string());
+    }
+    let valid = s.starts_with("claude-") && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+    valid.then_some(s)
+}
+
+pub fn model_label(id: &str) -> &str {
+    MODELS.iter().find(|(_, m, _)| *m == id).map(|(_, _, label)| *label).unwrap_or(id)
+}
+
+/// List prices in USD per million (input, output) tokens.
+fn price(model: &str) -> Option<(f64, f64)> {
+    Some(match model {
+        m if m.starts_with("claude-fable") || m.starts_with("claude-mythos") => (10.0, 50.0),
+        m if m.starts_with("claude-opus-5-5") => (4.0, 20.0),
+        m if m.starts_with("claude-opus") => (5.0, 25.0),
+        m if m.starts_with("claude-sonnet-4") => (3.0, 15.0),
+        m if m.starts_with("claude-sonnet") => (2.0, 10.0),
+        m if m.starts_with("claude-haiku") => (1.0, 5.0),
+        _ => return None,
+    })
+}
+
 pub struct Completion {
     pub text: String,
-    /// The model that actually answered (differs from MODEL if a fallback served the request).
+    /// The model that actually answered (differs from the requested one if a fallback served the request).
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub truncated: bool,
-    /// Rough cost at Opus 5.5 list prices; `None` when the review ran on a Claude subscription.
+    /// Rough cost at list prices; `None` when the review ran on a Claude subscription.
     pub cost_usd: Option<f64>,
 }
 
@@ -51,38 +108,39 @@ impl Claude {
         }
     }
 
-    pub async fn complete(&self, system: &str, user: &str) -> Result<Completion> {
+    pub async fn complete(&self, settings: &Settings, system: &str, user: &str) -> Result<Completion> {
         match &self.backend {
-            Backend::Api { http, api_key } => complete_api(http, api_key, system, user).await,
-            Backend::Cli { bin } => complete_cli(bin, system, user).await,
+            Backend::Api { http, api_key } => complete_api(http, api_key, settings, system, user).await,
+            Backend::Cli { bin } => complete_cli(bin, settings, system, user).await,
         }
     }
 }
 
-async fn complete_api(http: &Client, api_key: &str, system: &str, user: &str) -> Result<Completion> {
-    let body = json!({
-        "model": MODEL,
+async fn complete_api(http: &Client, api_key: &str, settings: &Settings, system: &str, user: &str) -> Result<Completion> {
+    let mut body = json!({
+        "model": settings.model,
         "max_tokens": MAX_TOKENS,
-        "thinking": { "type": "adaptive" },
-        "output_config": { "effort": EFFORT },
-        // If a safety classifier declines, the API re-runs the request on a suitable fallback model.
-        "fallbacks": "default",
         "system": system,
         "messages": [{ "role": "user", "content": user }],
     });
+    if settings.uses_effort() {
+        body["thinking"] = json!({ "type": "adaptive" });
+        body["output_config"] = json!({ "effort": settings.effort });
+        // If a safety classifier declines, the API re-runs the request on a suitable fallback model.
+        body["fallbacks"] = json!("default");
+    }
 
     let mut attempt = 0;
     let resp = loop {
         attempt += 1;
-        let result = http
+        let mut req = http
             .post("https://api.anthropic.com/v1/messages")
             .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "server-side-fallback-2026-07-01")
-            .timeout(Duration::from_secs(900))
-            .json(&body)
-            .send()
-            .await;
+            .header("anthropic-version", "2023-06-01");
+        if settings.uses_effort() {
+            req = req.header("anthropic-beta", "server-side-fallback-2026-07-01");
+        }
+        let result = req.timeout(Duration::from_secs(900)).json(&body).send().await;
         match result {
             Ok(resp) if resp.status().is_success() => break resp,
             Ok(resp) => {
@@ -103,7 +161,7 @@ async fn complete_api(http: &Client, api_key: &str, system: &str, user: &str) ->
     let stop = v["stop_reason"].as_str().unwrap_or_default();
     if stop == "refusal" {
         bail!(
-            "Claude declined to review this PR (category: {})",
+            "Claude declined the request (category: {})",
             v["stop_details"]["category"].as_str().unwrap_or("none")
         );
     }
@@ -119,21 +177,23 @@ async fn complete_api(http: &Client, api_key: &str, system: &str, user: &str) ->
     let output_tokens = v["usage"]["output_tokens"].as_u64().unwrap_or(0);
     Ok(Completion {
         text,
-        model: v["model"].as_str().unwrap_or(MODEL).to_string(),
+        model: v["model"].as_str().unwrap_or(&settings.model).to_string(),
         input_tokens,
         output_tokens,
         truncated: stop == "max_tokens",
-        cost_usd: Some(input_tokens as f64 * 4.0 / 1e6 + output_tokens as f64 * 20.0 / 1e6),
+        cost_usd: price(v["model"].as_str().unwrap_or(&settings.model)).map(|(i, o)| (input_tokens as f64 * i + output_tokens as f64 * o) / 1e6),
     })
 }
 
 /// Runs `claude -p` with no tools, no MCP servers and no saved session; the prompt goes in on stdin.
-async fn complete_cli(bin: &str, system: &str, user: &str) -> Result<Completion> {
-    let mut child = tokio::process::Command::new(bin)
+async fn complete_cli(bin: &str, settings: &Settings, system: &str, user: &str) -> Result<Completion> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(["-p", "--model", &settings.model]);
+    if settings.uses_effort() {
+        cmd.args(["--effort", &settings.effort]);
+    }
+    let mut child = cmd
         .args([
-            "-p",
-            "--model", MODEL,
-            "--effort", EFFORT,
             "--output-format", "json",
             "--tools", "",
             "--strict-mcp-config",
@@ -172,7 +232,7 @@ async fn complete_cli(bin: &str, system: &str, user: &str) -> Result<Completion>
     }
     let stop = v["stop_reason"].as_str().unwrap_or_default();
     if stop == "refusal" {
-        bail!("Claude declined to review this PR");
+        bail!("Claude declined the request");
     }
     let usage = &v["usage"];
     let n = |k: &str| usage[k].as_u64().unwrap_or(0);
@@ -181,7 +241,7 @@ async fn complete_cli(bin: &str, system: &str, user: &str) -> Result<Completion>
         model: v["modelUsage"]
             .as_object()
             .and_then(|m| m.keys().next().cloned())
-            .unwrap_or_else(|| MODEL.to_string()),
+            .unwrap_or_else(|| settings.model.clone()),
         input_tokens: n("input_tokens") + n("cache_creation_input_tokens") + n("cache_read_input_tokens"),
         output_tokens: n("output_tokens"),
         truncated: stop == "max_tokens",

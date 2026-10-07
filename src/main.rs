@@ -1,6 +1,7 @@
 mod bot;
 mod claude;
 mod config;
+mod followup;
 mod github;
 mod review;
 mod setup;
@@ -90,6 +91,7 @@ async fn main() -> Result<()> {
     bot.reschedule();
     bot.refresh_home().await;
     tokio::spawn(bot.clone().run_scheduler());
+    tokio::spawn(bot.clone().run_followups());
     log(&format!("prbot running for GitHub @{}\n{}", bot.gh_login, bot.status_text()));
 
     loop {
@@ -114,8 +116,9 @@ async fn review_once(http: &reqwest::Client, url: Option<&String>) -> Result<()>
     let cfg = Config::from_env()?;
     let gh = GitHub::new(http.clone(), cfg.github_token.clone());
     let claude = make_claude(http, &cfg);
-    eprintln!("Reviewing {} with {} (effort {}) via {}…", pr.key(), claude::MODEL, claude::EFFORT, claude.describe());
-    let r = review::run(&gh, &claude, &pr).await?;
+    let settings = Store::load(cfg.state_path.clone())?.get().settings();
+    eprintln!("Reviewing {} with {} via {}…", pr.key(), settings.describe(), claude.describe());
+    let r = review::run(&gh, &claude, &settings, &pr, None).await?;
     println!("Verdict: {}\n\n{}", r.verdict, r.markdown());
     eprintln!("{} of {} finding(s) would be posted as inline comments.", r.inline_count(), r.findings.len());
     for note in &r.notes {

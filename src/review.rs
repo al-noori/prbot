@@ -1,13 +1,15 @@
 //! Gathers PR context from GitHub, asks Claude for a structured review,
 //! and renders it for Slack and for GitHub (summary + inline comments).
 
-use crate::claude::{self, Claude};
+use crate::claude::{Claude, Settings};
 use crate::github::{GitHub, PrInfo, PrRef};
 use anyhow::Result;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 
+/// Every inline comment the bot posts contains this, so replies to it can be recognised.
+pub const MARKER: &str = "🤖 Written by Claude via @";
 const MAX_DIFF_CHARS: usize = 600_000;
 const MAX_CONTEXT_CHARS: usize = 400_000;
 const MAX_CONTEXT_FILES: usize = 60;
@@ -91,7 +93,10 @@ pub struct Review {
     pub questions: Vec<String>,
     /// Limits of this review (truncated diff, files without full context, ...), shown to the user.
     pub notes: Vec<String>,
+    /// The model that answered.
     pub model: String,
+    pub settings: Settings,
+    pub rereview: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// `None` when the review ran on a Claude subscription through Claude Code.
@@ -100,7 +105,8 @@ pub struct Review {
     commentable: HashSet<(String, u64)>,
 }
 
-pub async fn run(gh: &GitHub, claude: &Claude, pr: &PrRef) -> Result<Review> {
+/// `previous` is the body of the last posted review, when this is a re-review after new commits.
+pub async fn run(gh: &GitHub, claude: &Claude, settings: &Settings, pr: &PrRef, previous: Option<&str>) -> Result<Review> {
     let info = gh.pr(pr).await?;
     let files = gh.files(pr).await?;
     let mut notes = Vec::new();
@@ -146,8 +152,8 @@ pub async fn run(gh: &GitHub, claude: &Claude, pr: &PrRef) -> Result<Review> {
         ));
     }
 
-    let prompt = build_prompt(pr, &info, &context, &diff, &notes);
-    let c = claude.complete(SYSTEM, &prompt).await?;
+    let prompt = build_prompt(pr, &info, &context, &diff, &notes, previous);
+    let c = claude.complete(settings, SYSTEM, &prompt).await?;
     if c.truncated {
         notes.push("The review hit the output limit and may be cut off.".into());
     }
@@ -169,6 +175,8 @@ pub async fn run(gh: &GitHub, claude: &Claude, pr: &PrRef) -> Result<Review> {
         questions: raw.questions,
         notes,
         model: c.model,
+        settings: settings.clone(),
+        rereview: previous.is_some(),
         input_tokens: c.input_tokens,
         output_tokens: c.output_tokens,
         cost_usd: c.cost_usd,
@@ -205,14 +213,29 @@ impl Review {
         s
     }
 
+    /// A few lines for Slack: the summary and one line per finding. The full review lives on GitHub.
+    pub fn slack_summary(&self) -> String {
+        let mut s: String = self.summary.trim().chars().take(700).collect();
+        if self.summary.trim().chars().count() > 700 {
+            s.push('…');
+        }
+        for f in self.findings.iter().take(6) {
+            s.push_str(&format!("\n• [{}] {}", f.severity, f.title.trim()));
+        }
+        if self.findings.len() > 6 {
+            s.push_str(&format!("\n• …and {} more", self.findings.len() - 6));
+        }
+        s
+    }
+
     /// Review body plus inline comments for GitHub. Findings that can't be attached
     /// to a line in the diff go into the body.
     pub fn github_review(&self, login: &str) -> (String, Vec<InlineComment>) {
         let mut body = format!(
-            "> 🤖 **Automated review by Claude** ({}, effort {}), posted by @{login}'s review bot. \
+            "> 🤖 **Automated {} by Claude** ({}), posted by @{login}'s review bot. \
              @{login} has not reviewed this PR personally.\n\n**Verdict:** {}\n\n### Summary\n{}\n",
-            claude::MODEL,
-            claude::EFFORT,
+            if self.rereview { "re-review after new commits" } else { "review" },
+            self.settings.describe(),
             self.verdict,
             self.summary.trim()
         );
@@ -336,7 +359,7 @@ fn commentable_lines(diff: &str) -> HashSet<(String, u64)> {
     set
 }
 
-fn build_prompt(pr: &PrRef, i: &PrInfo, context: &str, diff: &str, notes: &[String]) -> String {
+fn build_prompt(pr: &PrRef, i: &PrInfo, context: &str, diff: &str, notes: &[String], previous: Option<&str>) -> String {
     let description = if i.body.trim().is_empty() { "(no description)" } else { i.body.trim() };
     let mut p = format!(
         "<pull_request url=\"{}\">\n<title>{}</title>\n<author>{}</author>\n<branches>{} → {}</branches>\n\
@@ -349,6 +372,13 @@ fn build_prompt(pr: &PrRef, i: &PrInfo, context: &str, diff: &str, notes: &[Stri
         ));
     }
     p.push_str(&format!("<diff>\n{diff}\n</diff>\n\n"));
+    if let Some(prev) = previous {
+        p.push_str(&format!(
+            "<previous_review note=\"your earlier review of this PR, posted before the latest commits\">\n{prev}\n</previous_review>\n\
+             This is a re-review after new commits. Start the summary by saying which earlier findings are now fixed. \
+             Repeat an earlier finding only if it is still present, and keep the focus on what changed.\n\n"
+        ));
+    }
     if !notes.is_empty() {
         p.push_str(&format!(
             "<review_limits>\n{}\n</review_limits>\nMention these limits briefly in your summary.\n\n",

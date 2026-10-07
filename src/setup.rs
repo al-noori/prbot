@@ -1,9 +1,11 @@
 //! `prbot setup`: interactive first-time configuration that writes `.env`.
 //! `prbot doctor`: checks the configuration and every connection.
 
+use crate::claude::Settings;
 use crate::config::{self, var};
 use crate::github::GitHub;
 use crate::slack::Slack;
+use crate::state::{State, Store};
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode, Url};
@@ -64,7 +66,8 @@ pub async fn setup(http: &Client) -> Result<()> {
     heading("3/4 Slack app");
     let mut app_token = var("SLACK_APP_TOKEN").ok();
     let mut bot_token = var("SLACK_BOT_TOKEN").ok();
-    let mut app_name = "PR Reviewer".to_string();
+    // Named after the GitHub login so teammates' apps are easy to tell apart (Slack allows 35 characters).
+    let mut app_name = Some(format!("PR Reviewer ({login})")).filter(|n| n.chars().count() <= 35).unwrap_or_else(|| "PR Reviewer".into());
     let mut fresh = false;
     if let (Some(app), Some(bot)) = (&app_token, &bot_token) {
         if let Ok(team) = check_slack(http, bot, app).await {
@@ -179,7 +182,7 @@ pub async fn doctor(http: &Client) -> Result<()> {
     ok &= show("GitHub", check_github(http).await.map(|l| format!("@{l}")));
     let claude = match var("ANTHROPIC_API_KEY") {
         Ok(key) => check_api_key(http, &key).await,
-        Err(_) => check_claude_cli(&config::claude_bin()).map(|who| format!("Claude Code, {who}")),
+        Err(_) => check_claude_cli(&config::claude_bin()).map(|who| format!("Claude Code, {who}; reviews use {}", configured_settings().describe())),
     };
     ok &= show("Claude", claude);
 
@@ -238,17 +241,23 @@ fn check_claude_cli(bin: &str) -> Result<String> {
     Ok(who)
 }
 
+/// The model and effort reviews use (Slack choice in the state file, else CLAUDE_MODEL / CLAUDE_EFFORT, else defaults).
+fn configured_settings() -> Settings {
+    Store::load(config::state_path()).map(|s| s.get().settings()).unwrap_or_else(|_| State::default().settings())
+}
+
 async fn check_api_key(http: &Client, key: &str) -> Result<String> {
+    let settings = configured_settings();
     let resp = http
-        .get(format!("https://api.anthropic.com/v1/models/{}", crate::claude::MODEL))
+        .get(format!("https://api.anthropic.com/v1/models/{}", settings.model))
         .header("x-api-key", key)
         .header("anthropic-version", "2023-06-01")
         .send()
         .await?;
     match resp.status() {
-        s if s.is_success() => Ok(format!("Anthropic API key works for {}", crate::claude::MODEL)),
+        s if s.is_success() => Ok(format!("Anthropic API key works for {}", settings.describe())),
         StatusCode::UNAUTHORIZED => bail!("ANTHROPIC_API_KEY is invalid"),
-        StatusCode::NOT_FOUND => bail!("ANTHROPIC_API_KEY has no access to {}", crate::claude::MODEL),
+        StatusCode::NOT_FOUND => bail!("ANTHROPIC_API_KEY has no access to {}", settings.model),
         s => bail!("Anthropic API returned {s}"),
     }
 }

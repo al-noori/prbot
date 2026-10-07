@@ -116,31 +116,3 @@ impl Slack {
 pub fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
-
-/// Splits Markdown into chunks of at most ~`max` chars on line boundaries,
-/// closing and reopening code fences that span a split.
-pub fn chunk_markdown(text: &str, max: usize) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut cur = String::new();
-    let mut in_fence = false;
-    for line in text.lines() {
-        if !cur.is_empty() && cur.len() + line.len() + 8 > max {
-            if in_fence {
-                cur.push_str("```\n");
-            }
-            chunks.push(std::mem::take(&mut cur));
-            if in_fence {
-                cur.push_str("```\n");
-            }
-        }
-        cur.push_str(line);
-        cur.push('\n');
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-        }
-    }
-    if !cur.trim().is_empty() {
-        chunks.push(cur);
-    }
-    chunks
-}
