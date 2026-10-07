@@ -4,6 +4,8 @@ mod config;
 mod followup;
 mod github;
 mod lifecycle;
+mod overview;
+mod relay;
 mod review;
 mod setup;
 mod slack;
@@ -29,6 +31,8 @@ Usage:
   prbot doctor          check the configuration and connections
   prbot status          show whether the bot is running
   prbot stop            stop the running bot (Slack then shows it as stopped)
+  prbot invite          a message with the team code, to set up a teammate in a minute
+  prbot autostart on|off  start prbot at login (Windows)
   prbot review <url>    review one PR and print it, without Slack
   prbot --version";
 
@@ -57,6 +61,17 @@ async fn main() -> Result<()> {
         Some("doctor") => return setup::doctor(&http).await,
         Some("review") => return review_once(&http, args.get(2)).await,
         Some("stop") => return lifecycle::stop().await,
+        Some("invite") => return setup::invite(),
+        Some("autostart") => {
+            let on = match args.get(2).map(String::as_str) {
+                Some("on") => true,
+                Some("off") => false,
+                _ => bail!("usage: prbot autostart on|off"),
+            };
+            lifecycle::autostart(on)?;
+            println!("prbot {} start at login.", if on { "will" } else { "won't" });
+            return Ok(());
+        }
         Some("status") => {
             println!("prbot is {}.", if lifecycle::is_running() { "running" } else { "not running" });
             return Ok(());
@@ -102,6 +117,7 @@ async fn main() -> Result<()> {
     tokio::spawn(bot.clone().run_scheduler());
     tokio::spawn(bot.clone().run_followups());
     tokio::spawn(bot.clone().run_heartbeat());
+    tokio::spawn(bot.clone().run_forward_poller());
     log(&format!("prbot running for GitHub @{}\n{}", bot.gh_login, bot.status_text()));
 
     let reason = tokio::select! {
@@ -114,13 +130,25 @@ async fn main() -> Result<()> {
 }
 
 /// Keeps a Socket Mode connection open, reconnecting whenever it drops.
+/// Repeated failures back off up to 5 minutes. Slack allows 10 connections per app, so in a big team
+/// some copies may not get one; they still receive their events through forwarding.
 async fn socket_loop(bot: &Arc<Bot>) {
+    let mut failures = 0u32;
     loop {
-        match socket_session(bot).await {
-            Ok(()) => log("Socket Mode connection closed; reconnecting"),
-            Err(e) => log(&format!("Socket Mode error: {e:#}; reconnecting in 5 s")),
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        let wait = match socket_session(bot).await {
+            Ok(()) => {
+                failures = 0;
+                log("Socket Mode connection closed; reconnecting");
+                5
+            }
+            Err(e) => {
+                failures += 1;
+                let wait = (5u64 << failures.min(6)).min(300);
+                log(&format!("Socket Mode error: {e:#}; reconnecting in {wait} s"));
+                wait
+            }
+        };
+        tokio::time::sleep(Duration::from_secs(wait)).await;
     }
 }
 

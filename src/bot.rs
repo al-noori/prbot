@@ -28,6 +28,8 @@ const HELP: &str = "*PR Reviewer*: Claude reviews PRs that request your review, 
 `/prreview model opus|sonnet|haiku|fable`: choose the Claude model (or a full model ID)
 `/prreview effort low|medium|high|xhigh|max`: how hard Claude thinks
 `/prreview scope me|team`: only PRs requesting you directly, or also through your teams
+`/prreview list`: the overview of your PRs (also posted on every scheduled check)
+`/prreview done <PR URL>` / `/prreview reopen <PR URL>`: mark a PR as reviewed by you (stops follow-ups), or undo that
 `/prreview <PR URL>`: review one PR now (you can also just DM me the link)";
 
 pub struct Bot {
@@ -70,7 +72,30 @@ impl Bot {
 
     // ---------- Socket Mode dispatch ----------
 
+    /// Every Socket Mode envelope lands here. The owner's are handled; other team members' go to their own prbot.
     pub async fn handle(self: Arc<Self>, kind: String, payload: Value) {
+        let ev = &payload["event"];
+        let human_dm = ev["type"] == "message" && ev["channel_type"] == "im" && ev.get("bot_id").is_none() && ev.get("subtype").is_none();
+        let sender = match kind.as_str() {
+            "slash_commands" => payload["user_id"].as_str(),
+            "interactive" => payload["user"]["id"].as_str(),
+            "events_api" if human_dm || ev["type"] == "app_home_opened" => ev["user"].as_str(),
+            _ => None,
+        };
+        match sender {
+            Some(user) if user == self.owner => self.handle_own(kind, payload).await,
+            // Their prbot publishes their Home tab itself.
+            Some(_) if ev["type"] == "app_home_opened" => {}
+            Some(user) => {
+                if let Err(e) = self.forward(&kind, &payload, user).await {
+                    crate::log(&format!("could not forward {kind} to {user}: {e:#}"));
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub async fn handle_own(self: Arc<Self>, kind: String, payload: Value) {
         let result = match kind.as_str() {
             "slash_commands" => self.on_slash(payload).await,
             "events_api" => self.on_event(payload).await,
@@ -85,34 +110,15 @@ impl Bot {
 
     async fn on_slash(self: &Arc<Self>, p: Value) -> Result<()> {
         let response_url = p["response_url"].as_str().unwrap_or_default().to_string();
-        let reply = if p["user_id"] != self.owner.as_str() {
-            self.not_yours()
-        } else {
-            self.command(p["text"].as_str().unwrap_or_default()).await?
-        };
+        let reply = self.command(p["text"].as_str().unwrap_or_default()).await?;
         self.slack.respond(&response_url, &reply).await
     }
 
     async fn on_event(self: &Arc<Self>, p: Value) -> Result<()> {
         let ev = &p["event"];
         let from_owner = ev["user"] == self.owner.as_str();
-        let human_dm = ev["channel_type"] == "im" && ev.get("bot_id").is_none() && ev.get("subtype").is_none();
         match ev["type"].as_str().unwrap_or_default() {
             "app_home_opened" if from_owner && ev["tab"] == "home" => self.refresh_home().await,
-            // Someone else found the app: explain whose it is and how to get one.
-            "app_home_opened" if ev["tab"] == "home" => {
-                if let Some(user) = ev["user"].as_str() {
-                    let view = json!({ "type": "home", "blocks": [
-                        { "type": "section", "text": { "type": "mrkdwn", "text": self.not_yours() } }
-                    ] });
-                    self.slack.publish_home(user, view).await?;
-                }
-            }
-            "message" if !from_owner && human_dm => {
-                if let Some(channel) = ev["channel"].as_str() {
-                    self.slack.post(channel, &self.not_yours(), None, None).await?;
-                }
-            }
             "message"
                 if from_owner
                     && ev["channel_type"] == "im"
@@ -159,6 +165,11 @@ impl Bot {
                 "check_now" => {
                     self.command("now").await?;
                 }
+                "pr_menu" => {
+                    if let Some(v) = a["selected_option"]["value"].as_str() {
+                        self.on_pr_menu(&p, v).await?;
+                    }
+                }
                 "set_schedule" | "set_model" | "set_effort" => {
                     if let Some(v) = a["selected_option"]["value"].as_str() {
                         self.command(v).await?;
@@ -182,6 +193,18 @@ impl Bot {
 
     pub async fn command(self: &Arc<Self>, text: &str) -> Result<String> {
         let text = text.trim();
+        let first = text.split_whitespace().next().unwrap_or_default().to_lowercase();
+        if matches!(first.as_str(), "done" | "reopen") {
+            let pr = PrRef::parse(text).or_else(|| text.split_whitespace().nth(1).and_then(PrRef::parse_key));
+            return match pr {
+                Some(pr) => self.set_done(&pr, first == "done").await,
+                None => Ok(format!("Use `{first} <PR URL>`.")),
+            };
+        }
+        if matches!(first.as_str(), "list" | "prs" | "overview") {
+            tokio::spawn(self.clone().check_requests(true));
+            return Ok("Putting together the overview of your PRs…".into());
+        }
         if let Some(pr) = PrRef::parse(text) {
             return Ok(if self.spawn_review(pr.clone()) {
                 format!("Reviewing {}. I'll post the review in our DM.", pr.key())
@@ -314,15 +337,6 @@ impl Bot {
         Ok(reply)
     }
 
-    /// What everyone except the owner sees.
-    fn not_yours(&self) -> String {
-        format!(
-            "This is <@{}>'s personal PR reviewer, so it only works for them. To get your own, which reviews the PRs that request *your* review using your GitHub and Claude accounts, follow the quickstart at {} (about 5 minutes).",
-            self.owner,
-            env!("CARGO_PKG_REPOSITORY")
-        )
-    }
-
     pub fn status_text(&self) -> String {
         let st = self.store.get();
         let next = *self.next_run.lock().unwrap();
@@ -401,46 +415,13 @@ impl Bot {
         }
     }
 
-    /// Lists every PR requesting your review in a DM, and starts reviews for the ones that need one.
+    /// Starts reviews for PRs that need one and posts the overview of your PRs.
     async fn try_check(self: &Arc<Self>, manual: bool) -> Result<()> {
-        let st = self.store.get();
-        let prs = self.gh.review_requests(&st.query).await?;
-        let mut lines = Vec::new();
-        let mut queued = 0;
-        for pr in prs {
-            let info = self.gh.pr(&pr).await?;
-            let status = if info.draft && self.cfg.skip_drafts {
-                "draft, skipped"
-            } else if st.reviewed.get(&pr.key()) == Some(&info.head_sha) {
-                "already reviewed at the latest commit"
-            } else if self.in_flight.lock().unwrap().contains(&pr.key()) {
-                "review running"
-            } else if queued >= self.cfg.max_reviews_per_run {
-                "waiting for the next check (limit per check reached)"
-            } else if self.spawn_review(pr.clone()) {
-                queued += 1;
-                "reviewing now"
-            } else {
-                "review running"
-            };
-            lines.push(format!(
-                "• <{}|{}> {} (by {}): _{status}_",
-                pr.url(),
-                pr.key(),
-                slack::esc(&info.title),
-                slack::esc(&info.author)
-            ));
-        }
-        self.store.update(|s| s.last_check = Some(Local::now()))?;
-        let header = if manual { "Check requested by you" } else { "Scheduled check" };
-        let msg = if lines.is_empty() {
-            format!(":clipboard: *{header}:* no open PRs request your review right now.")
-        } else {
-            format!(":clipboard: *{header}: {} PR(s) request your review*\n{}", lines.len(), lines.join("\n"))
-        };
-        self.slack.post(&self.dm, &msg, None, None).await?;
-        self.refresh_home().await;
-        Ok(())
+        self.check_and_overview(manual).await
+    }
+
+    pub fn is_reviewing(&self, key: &str) -> bool {
+        self.in_flight.lock().unwrap().contains(key)
     }
 
     // ---------- Reviews ----------
@@ -548,13 +529,18 @@ impl Bot {
                 url
             }
         };
-        let mut blocks = p["message"]["blocks"].as_array().cloned().unwrap_or_default();
+        // A click forwarded by another team member's prbot arrives without the message itself.
+        let message = match p["message"].is_null() {
+            true => self.slack.message(&channel, &ts).await?,
+            false => p["message"].clone(),
+        };
+        let mut blocks = message["blocks"].as_array().cloned().unwrap_or_default();
         blocks.retain(|b| b["type"] != "actions");
         blocks.push(json!({
             "type": "context",
             "elements": [{ "type": "mrkdwn", "text": format!(":white_check_mark: Posted to the PR: <{link}|view on GitHub>") }]
         }));
-        let text = p["message"]["text"].as_str().unwrap_or("PR review").to_string();
+        let text = message["text"].as_str().unwrap_or("PR review").to_string();
         self.slack.update(&channel, &ts, &text, Some(Value::Array(blocks))).await
     }
 

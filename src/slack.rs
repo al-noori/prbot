@@ -32,6 +32,71 @@ impl Slack {
         Ok(v)
     }
 
+    /// Read methods take query parameters rather than a JSON body.
+    async fn api_get(&self, method: &str, params: &[(&str, &str)]) -> Result<Value> {
+        let v: Value = self
+            .http
+            .get(format!("https://slack.com/api/{method}"))
+            .bearer_auth(&self.bot_token)
+            .query(params)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if v["ok"].as_bool() != Some(true) {
+            bail!("Slack {method} failed: {}", v["error"].as_str().unwrap_or("unknown error"));
+        }
+        Ok(v)
+    }
+
+    /// Messages in `channel` newer than `oldest`, newest first, including their metadata.
+    pub async fn history(&self, channel: &str, oldest: &str) -> Result<Vec<Value>> {
+        let v = self
+            .api_get(
+                "conversations.history",
+                &[("channel", channel), ("oldest", oldest), ("limit", "100"), ("include_all_metadata", "true")],
+            )
+            .await?;
+        Ok(v["messages"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// One message by its `ts`.
+    pub async fn message(&self, channel: &str, ts: &str) -> Result<Value> {
+        let v = self
+            .api_get("conversations.history", &[("channel", channel), ("latest", ts), ("inclusive", "true"), ("limit", "1")])
+            .await?;
+        v["messages"].get(0).cloned().context("message not found")
+    }
+
+    /// Posts a message carrying hidden structured metadata. Returns its `ts`.
+    pub async fn post_with_metadata(&self, channel: &str, text: &str, event_type: &str, payload: Value) -> Result<String> {
+        let body = json!({
+            "channel": channel,
+            "text": text,
+            "unfurl_links": false,
+            "metadata": { "event_type": event_type, "event_payload": payload },
+        });
+        let v = self.api("chat.postMessage", body).await?;
+        Ok(v["ts"].as_str().unwrap_or_default().to_string())
+    }
+
+    pub async fn delete(&self, channel: &str, ts: &str) -> Result<()> {
+        self.api("chat.delete", json!({ "channel": channel, "ts": ts })).await.map(|_| ())
+    }
+
+    /// The Slack user with this email: `Ok(None)` if there is none, an error if the app may not look it up.
+    pub async fn lookup_by_email(&self, email: &str) -> Result<Option<(String, String)>> {
+        match self.api_get("users.lookupByEmail", &[("email", email)]).await {
+            Ok(v) => {
+                let u = &v["user"];
+                let name = u["real_name"].as_str().or(u["name"].as_str()).unwrap_or("?").to_string();
+                Ok(u["id"].as_str().map(|id| (id.to_string(), name)))
+            }
+            Err(e) if e.to_string().contains("users_not_found") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// WebSocket URL for Socket Mode (uses the app-level token).
     pub async fn socket_url(&self) -> Result<String> {
         let v: Value = self

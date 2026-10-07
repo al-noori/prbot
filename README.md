@@ -4,37 +4,38 @@ A Slack bot that finds the GitHub PRs requesting your review, has Claude review 
 
 It runs on your own machine with your own accounts: GitHub through the `gh` CLI, Claude through Claude Code (`claude`), or an Anthropic API key if you set one. Slack connects over Socket Mode, so prbot needs no public URL.
 
-## Quickstart
+## Quickstart (Windows, about a minute)
 
-1. **Install and log in to the two CLIs:** [GitHub CLI](https://cli.github.com) and [Claude Code](https://claude.com/claude-code). `prbot setup` offers to log you in if you haven't yet.
+Get the **team code** from a teammate who already uses prbot (they run `prbot invite`). Then, in PowerShell:
 
-2. **Download prbot** (no Rust needed).
+```powershell
+irm https://raw.githubusercontent.com/al-noori/prbot/main/install.ps1 | iex
+```
 
-   Windows (PowerShell):
+This downloads prbot and runs `prbot setup`, which:
 
-   ```powershell
-   New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\prbot" | Out-Null
-   gh release download --repo al-noori/prbot --pattern prbot-windows-x86_64.exe --output "$env:LOCALAPPDATA\prbot\prbot.exe" --clobber
-   cd "$env:LOCALAPPDATA\prbot"
-   ```
+1. installs the GitHub CLI and Claude Code if they're missing, and logs you in to both;
+2. asks for the team code;
+3. finds you in Slack by your email and sends you a DM;
+4. starts prbot in the background and sets it to start every time you log in.
 
-   macOS and Linux (pick `prbot-macos-arm64`, `prbot-macos-x86_64`, `prbot-linux-x86_64` or `prbot-linux-arm64`):
+Then send `/prreview help` to the app in Slack. Scheduled checks start **off**; turn them on with `/prreview on`.
 
-   ```bash
-   mkdir -p ~/.local/bin && gh release download --repo al-noori/prbot --pattern prbot-macos-arm64 --output ~/.local/bin/prbot --clobber && chmod +x ~/.local/bin/prbot
-   ```
+**No team code yet, so you're the first in your workspace?** Run the same command and press Enter at the team-code question. Setup then creates the Slack app with you:
+- It opens Slack with the app manifest already filled in. Click **Create**.
+- Under Basic Information → App-Level Tokens, click **Generate**, add the scope `connections:write` and paste the `xapp-…` token.
+- Under Install App, click **Install to workspace** (or **Request to Install** if an admin has to approve it) and paste the `xoxb-…` token. If you're waiting for approval, run `prbot setup` again once it's approved; setup picks up where you left off.
 
-3. **Run `prbot setup`.** It checks GitHub and Claude, opens Slack with the app manifest already filled in, and asks for two tokens:
-   - the **app-level token** (`xapp-…`): Basic Information → App-Level Tokens → Generate, with the scope `connections:write`;
-   - the **bot token** (`xoxb-…`): Install App → Install to workspace.
+Afterwards, run `prbot invite` to get the message with the team code for your teammates.
 
-   If your workspace needs admin approval, click **Request to Install** and run `prbot setup` again once it's approved. Setup picks up where you left off.
+**macOS and Linux:** install the [GitHub CLI](https://cli.github.com) and [Claude Code](https://claude.com/claude-code), download prbot (pick `prbot-macos-arm64`, `prbot-macos-x86_64`, `prbot-linux-x86_64` or `prbot-linux-arm64`), then run `prbot setup`:
 
-4. **Send the bot any message in Slack** when setup asks. That's how prbot learns your Slack member ID; only you can use the bot.
+```bash
+mkdir -p ~/.local/bin && gh release download --repo al-noori/prbot --pattern prbot-macos-arm64 --output ~/.local/bin/prbot --clobber && chmod +x ~/.local/bin/prbot
+prbot setup
+```
 
-5. **Start it with `prbot`**, then send `/prreview help` in Slack. Checks start **off**; turn them on with `/prreview on`.
-
-`prbot doctor` checks the configuration and every connection. `prbot status` tells you whether the bot is running, and `prbot stop` stops it. Only one copy runs per configuration, because a second copy would take half of Slack's events.
+Running the install command again updates prbot. `prbot doctor` checks the configuration and every connection. `prbot status` tells you whether the bot is running, and `prbot stop` stops it. `prbot autostart off` stops it from starting at login. Only one copy runs per configuration, because a second copy would take half of Slack's events.
 
 **Is it running?** Look at the bot's Home tab in Slack, not the green dot next to its name. Slack doesn't let apps control that dot, so it stays green either way. The Home tab says "running since …" and refreshes every 5 minutes. When prbot stops (`prbot stop`, Ctrl+C, closing its window, or SIGTERM), the tab switches to "stopped". If the computer shuts down or the process is killed, the tab can't update, but its "updated" time stops moving.
 
@@ -55,6 +56,8 @@ Settings are saved to `%APPDATA%\prbot\.env` on Windows or `~/.config/prbot/.env
 | `/prreview model opus\|sonnet\|haiku\|fable` | Choose the Claude model (or give a full model ID) |
 | `/prreview effort low\|medium\|high\|xhigh\|max` | How hard Claude thinks (Haiku has no effort setting) |
 | `/prreview scope me\|team` | Only PRs requesting you directly, or also through your teams |
+| `/prreview list` | Post the overview of your PRs now |
+| `/prreview done <PR URL>` / `reopen <PR URL>` | Mark a PR as reviewed by you (stops follow-ups), or undo that |
 | `/prreview <PR URL>` | Review that PR now (or just DM the bot the link) |
 
 The Home tab has the same controls: on/off, check now, schedule, model, effort and follow-ups.
@@ -66,15 +69,29 @@ To review a PR in the terminal without Slack, run `prbot review https://github.c
 With `/prreview followup on`, prbot keeps an eye on every PR it has posted a review on. It checks every 2 minutes, within your working hours:
 
 - **New commits** get a re-review right away. Claude sees its previous review, says which findings are fixed and focuses on what changed.
-- **Replies** to Claude's inline comments, and PR comments that @mention you, get an answer from Claude in the same thread, marked as written by Claude and not reviewed by you. If the reply is just a thanks, or meant for someone else, Claude doesn't answer.
+- **Replies** to Claude's inline comments, and PR comments that @mention you, get an answer from Claude in the same thread, marked as written by Claude and not reviewed by you. If a comment needs no answer (a thanks, an acknowledgement, or something meant for someone else), Claude gives it a 👍 instead.
 
 Comments by bots and by you are never answered, and neither is a comment you've already replied to yourself. Each PR gets at most 5 replies a day. Reviews posted before follow-ups were turned on are followed too, starting from the time they were posted. A PR stops being followed when it's closed or merged, or after 14 days without activity. Every re-review and reply also shows up as a short message in Slack.
 
-## For teammates
+## Overview of your PRs
 
-Anyone in the workspace can find your app in Slack, but it's personal: it reviews *your* review requests with *your* accounts, and answers everyone else with a pointer to this README. Each person runs their own prbot with their own Slack app, which takes about 5 minutes with the quickstart above. `prbot setup` names the app after your GitHub login, so the apps are easy to tell apart.
+Every scheduled check (and `/prreview list`) posts one message listing the PRs on your plate: the ones requesting your review, the ones Claude reviewed and is following, and the ones you marked done.
 
-Every app registers `/prreview`. If Slack ever routes your `/prreview` to someone else's app, you'll get that pointer instead. DMs and the Home tab of your own app always reach your prbot and accept the same commands. Some workspaces need an admin to approve each new app once.
+- ⏳ **waiting:** not reviewed yet (a draft, or the per-check limit was reached)
+- 🔄 **in work:** Claude is reviewing it, or reviewed it and the author is on it
+- ✅ **done:** you marked it as reviewed from your side
+
+Each row has a ⋯ menu. **Details** answers in the thread with the PR's state, CI checks, Claude's last review and verdict, new commits since then, the discussion, and other reviewers' verdicts. **Mark done** tells prbot you're finished with the PR: it shows ✅ and Claude stops following it. If the author pushes new commits and requests your review again, the PR is no longer marked done and gets reviewed as usual. **Reopen** undoes Mark done. Merged and closed PRs drop off the list.
+
+## Teams: one Slack app for everyone
+
+A team shares **one Slack app**, installed and approved once. Everything else stays personal. Each person's prbot runs on their own computer and uses their own GitHub login and their own Claude account. Reviews are posted under their own name, and nobody's Claude usage pays for anyone else's reviews.
+
+Slack hands each event (a `/prreview`, a click, a DM) to just one of the prbots connected to the app. If that event belongs to someone else, that prbot forwards it into the person's DM with the bot as a short note, and their prbot picks it up within about 10 seconds and deletes the note. If their prbot isn't running, the note stays and says so. Slack allows 10 live connections per app, so in bigger teams some prbots work through forwarding only, which is a little slower.
+
+**The team code contains the app's Slack tokens.** Share it only within your team: anyone who has it can read every DM with the bot (review summaries, including private repos) and post as the bot. It gives no access to anyone's GitHub or Claude account. If it leaks, regenerate the app's tokens in the Slack app settings and send a new code.
+
+**Finding people by email** needs the scopes `users:read` and `users:read.email`. Apps created from the current manifest have them. For an older app, add the two scopes under App Manifest (or OAuth & Permissions) and reinstall the app. Without them, setup asks for the member ID instead (Slack profile → ⋮ → Copy member ID).
 
 ## Run at login
 

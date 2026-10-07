@@ -2,7 +2,7 @@
 //! Slack's events between them), `prbot stop` / `prbot status`, and the signals that end the bot.
 
 use crate::config;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -55,6 +55,70 @@ pub async fn stop() -> Result<()> {
         }
     }
     bail!("prbot did not stop within 15 seconds")
+}
+
+/// The prbot folder as an absolute path without Windows' `\\?\` prefix.
+fn absolute_home() -> PathBuf {
+    let home = config::home_dir();
+    let abs = std::fs::canonicalize(&home).unwrap_or(home);
+    PathBuf::from(abs.to_string_lossy().trim_start_matches(r"\\?\"))
+}
+
+#[cfg(windows)]
+fn startup_shortcut() -> Result<PathBuf> {
+    let appdata = std::env::var_os("APPDATA").context("APPDATA is not set")?;
+    Ok(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Startup\prbot.lnk"))
+}
+
+/// `prbot autostart on|off`: a shortcut in the Windows Startup folder that runs prbot without a window.
+#[cfg(windows)]
+pub fn autostart(on: bool) -> Result<()> {
+    let lnk = startup_shortcut()?;
+    if !on {
+        if lnk.exists() {
+            std::fs::remove_file(&lnk)?;
+        }
+        return Ok(());
+    }
+    let exe = std::env::current_exe()?;
+    let quote = |p: &std::path::Path| p.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{}'); $s.TargetPath = 'conhost.exe'; \
+         $s.Arguments = '--headless \"{}\"'; $s.WorkingDirectory = '{}'; $s.WindowStyle = 7; $s.Save()",
+        quote(&lnk),
+        quote(&exe),
+        quote(&absolute_home())
+    );
+    let status = std::process::Command::new("powershell").args(["-NoProfile", "-Command", &script]).status()?;
+    if !status.success() {
+        bail!("could not create the Startup shortcut");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn autostart(_on: bool) -> Result<()> {
+    bail!("automatic start is only set up on Windows so far; see \"Run at login\" in the README")
+}
+
+/// Starts prbot in the background without a window, detached from this terminal.
+#[cfg(windows)]
+pub fn start_in_background() -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    std::process::Command::new("conhost.exe")
+        .arg("--headless")
+        .arg(std::env::current_exe()?)
+        .current_dir(absolute_home())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn start_in_background() -> Result<()> {
+    bail!("starting in the background is only set up on Windows so far; run `prbot`")
 }
 
 /// Resolves with the reason when the bot should shut down: `prbot stop`, Ctrl+C, closing its

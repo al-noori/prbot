@@ -24,7 +24,7 @@
   },
   "oauth_config": {
     "scopes": {
-      "bot": ["chat:write", "commands", "im:history", "im:write"]
+      "bot": ["chat:write", "commands", "im:history", "im:write", "users:read", "users:read.email"]
     }
   },
   "settings": {
