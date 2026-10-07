@@ -17,14 +17,17 @@ impl Bot {
     /// Hands an event from another team member to their own prbot.
     pub async fn forward(&self, kind: &str, p: &Value, user: &str) -> Result<()> {
         let what = match kind {
-            "slash_commands" => format!("`{} {}`", p["command"].as_str().unwrap_or("/prreview"), p["text"].as_str().unwrap_or_default()),
+            "slash_commands" => format!(
+                "`{} {}`",
+                p["command"].as_str().unwrap_or("/prreview"),
+                p["text"].as_str().unwrap_or_default()
+            ),
             "interactive" => "Your click".into(),
             _ => "Your message".into(),
         };
         let text = format!(
             ":hourglass_flowing_sand: {what} is on its way to your prbot. If nothing happens within a minute, your prbot isn't running: \
-             start it on your computer with `prbot`. Don't have one yet? Ask a teammate for the team code and follow {} (about a minute).",
-            env!("CARGO_PKG_REPOSITORY")
+             start it on your computer with `prbot`. Don't have one yet? Open my *Home* tab and follow the steps (about a minute)."
         );
         let dm = self.slack.open_dm(user).await?;
         let payload = json!({ "kind": kind, "payload": slim(kind, p).to_string() });
@@ -33,6 +36,40 @@ impl Bot {
             self.slack.respond(url, ":hourglass_flowing_sand: Passing this to your prbot…").await?;
         }
         Ok(())
+    }
+
+    /// Home tab for someone in the workspace who has no prbot yet: one PowerShell line that installs
+    /// prbot and joins this app. Guests (and anyone whose account can't be checked) get no team code.
+    pub async fn show_setup_home(&self, user: &str) -> Result<()> {
+        let member = match self.slack.user_info(user).await {
+            Ok(u) => !(u["is_restricted"] == true || u["is_ultra_restricted"] == true || u["is_bot"] == true || u["deleted"] == true),
+            Err(e) => {
+                crate::log(&format!("could not check {user} before showing the team code: {e:#}"));
+                false
+            }
+        };
+        let intro = "*Get your own PR reviewer.* Claude reviews the GitHub PRs that request *your* review, posts the review on the PR \
+                     (marked as written by Claude, not by you) and sends you a short summary here. It runs on your computer \
+                     with your own GitHub and Claude accounts.";
+        let mut blocks = vec![
+            json!({ "type": "header", "text": { "type": "plain_text", "text": "PR Reviewer" } }),
+            json!({ "type": "section", "text": { "type": "mrkdwn", "text": intro } }),
+        ];
+        if member {
+            let line = crate::setup::setup_line()?;
+            blocks.push(json!({ "type": "section", "text": { "type": "mrkdwn", "text":
+                "*Set up on Windows (about a minute):* open PowerShell, paste this line and press Enter. It installs prbot \
+                 (and the GitHub CLI and Claude Code if you don't have them), logs you in, and starts prbot whenever you log in." } }));
+            blocks.push(json!({ "type": "section", "text": { "type": "mrkdwn", "text": format!("```{line}```") } }));
+            blocks.push(json!({ "type": "context", "elements": [{ "type": "mrkdwn", "text": format!(
+                "The line contains this team's code for the app: don't share it outside the team. macOS or Linux: see {}.",
+                env!("CARGO_PKG_REPOSITORY")) }] }));
+        } else {
+            blocks.push(json!({ "type": "section", "text": { "type": "mrkdwn", "text": format!(
+                "Ask a teammate who uses it to run `prbot invite` and send you the setup line, or see {}.",
+                env!("CARGO_PKG_REPOSITORY")) } }));
+        }
+        self.slack.publish_home(user, json!({ "type": "home", "blocks": blocks })).await
     }
 
     /// Picks up events other copies forwarded into the owner's DM.

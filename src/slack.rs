@@ -84,6 +84,12 @@ impl Slack {
         self.api("chat.delete", json!({ "channel": channel, "ts": ts })).await.map(|_| ())
     }
 
+    /// `users.info` (needs the users:read scope).
+    pub async fn user_info(&self, user: &str) -> Result<Value> {
+        let v = self.api_get("users.info", &[("user", user)]).await?;
+        Ok(v["user"].clone())
+    }
+
     /// The Slack user with this email: `Ok(None)` if there is none, an error if the app may not look it up.
     pub async fn lookup_by_email(&self, email: &str) -> Result<Option<(String, String)>> {
         match self.api_get("users.lookupByEmail", &[("email", email)]).await {

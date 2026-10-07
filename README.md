@@ -6,27 +6,27 @@ It runs on your own machine with your own accounts: GitHub through the `gh` CLI,
 
 ## Quickstart (Windows, about a minute)
 
-Get the **team code** from a teammate who already uses prbot (they run `prbot invite`). Then, in PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/al-noori/prbot/main/install.ps1 | iex
-```
-
-This downloads prbot and runs `prbot setup`, which:
+If your team already uses prbot: in Slack, open the **PR Reviewer** app (under Apps, or search for it) and go to its **Home** tab. It shows a setup line. Copy it into PowerShell and press Enter. That line downloads prbot and runs `prbot setup`, which:
 
 1. installs the GitHub CLI and Claude Code if they're missing, and logs you in to both;
-2. asks for the team code;
+2. joins your team's Slack app (the line carries the team code);
 3. finds you in Slack by your email and sends you a DM;
 4. starts prbot in the background and sets it to start every time you log in.
 
 Then send `/prreview help` to the app in Slack. Scheduled checks start **off**; turn them on with `/prreview on`.
 
-**No team code yet, so you're the first in your workspace?** Run the same command and press Enter at the team-code question. Setup then creates the Slack app with you:
+**First in your workspace?** Run this in PowerShell and press Enter when setup asks for a team code:
+
+```powershell
+irm https://raw.githubusercontent.com/al-noori/prbot/main/install.ps1 | iex
+```
+
+Setup then creates the Slack app with you. Setup then creates the Slack app with you:
 - It opens Slack with the app manifest already filled in. Click **Create**.
 - Under Basic Information → App-Level Tokens, click **Generate**, add the scope `connections:write` and paste the `xapp-…` token.
 - Under Install App, click **Install to workspace** (or **Request to Install** if an admin has to approve it) and paste the `xoxb-…` token. If you're waiting for approval, run `prbot setup` again once it's approved; setup picks up where you left off.
 
-Afterwards, run `prbot invite` to get the message with the team code for your teammates.
+Afterwards your teammates can set up from the app's Home tab. `prbot invite` also prints the setup line, if you'd rather send it.
 
 **macOS and Linux:** install the [GitHub CLI](https://cli.github.com) and [Claude Code](https://claude.com/claude-code), download prbot (pick `prbot-macos-arm64`, `prbot-macos-x86_64`, `prbot-linux-x86_64` or `prbot-linux-arm64`), then run `prbot setup`:
 
@@ -89,7 +89,7 @@ A team shares **one Slack app**, installed and approved once. Everything else st
 
 Slack hands each event (a `/prreview`, a click, a DM) to just one of the prbots connected to the app. If that event belongs to someone else, that prbot forwards it into the person's DM with the bot as a short note, and their prbot picks it up within about 10 seconds and deletes the note. If their prbot isn't running, the note stays and says so. Slack allows 10 live connections per app, so in bigger teams some prbots work through forwarding only, which is a little slower.
 
-**The team code contains the app's Slack tokens.** Share it only within your team: anyone who has it can read every DM with the bot (review summaries, including private repos) and post as the bot. It gives no access to anyone's GitHub or Claude account. If it leaks, regenerate the app's tokens in the Slack app settings and send a new code.
+**The team code contains the app's Slack tokens.** The Home tab shows the setup line (with the code) only to full members of your workspace, not to guests, and only while the app may check that (scope `users:read`). Share the code only within your team: anyone who has it can read every DM with the bot (review summaries, including private repos) and post as the bot. It gives no access to anyone's GitHub or Claude account. If it leaks, regenerate the app's tokens in the Slack app settings and send a new code.
 
 **Finding people by email** needs the scopes `users:read` and `users:read.email`. Apps created from the current manifest have them. For an older app, add the two scopes under App Manifest (or OAuth & Permissions) and reinstall the app. Without them, setup asks for the member ID instead (Slack profile → ⋮ → Copy member ID).
 

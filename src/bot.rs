@@ -84,8 +84,15 @@ impl Bot {
         };
         match sender {
             Some(user) if user == self.owner => self.handle_own(kind, payload).await,
-            // Their prbot publishes their Home tab itself.
-            Some(_) if ev["type"] == "app_home_opened" => {}
+            // Someone without a prbot (no Home view published for them yet) gets the setup
+            // instructions. Anyone else's prbot keeps their Home tab up to date itself.
+            Some(user) if ev["type"] == "app_home_opened" => {
+                if ev["view"].is_null() {
+                    if let Err(e) = self.show_setup_home(user).await {
+                        crate::log(&format!("could not show setup instructions to {user}: {e:#}"));
+                    }
+                }
+            }
             Some(user) => {
                 if let Err(e) = self.forward(&kind, &payload, user).await {
                     crate::log(&format!("could not forward {kind} to {user}: {e:#}"));
