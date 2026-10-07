@@ -1,9 +1,10 @@
 //! Minimal GitHub REST client.
 //!
 //! By design there is no function here to approve, request changes, or merge:
-//! the only write is `post_review`, which always uses event "COMMENT".
+//! the writes are `post_review` (always event "COMMENT"), `comment`, and `reply_to_review_comment`.
 
 use crate::review::InlineComment;
+use chrono::{DateTime, Utc};
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode, Url};
@@ -51,6 +52,7 @@ pub struct PrInfo {
     pub head_ref: String,
     pub base_ref: String,
     pub draft: bool,
+    pub open: bool,
     pub additions: u64,
     pub deletions: u64,
     pub changed_files: u64,
@@ -61,6 +63,38 @@ pub struct ChangedFile {
     pub filename: String,
     pub status: String,
     pub patch: Option<String>,
+}
+
+
+/// A PR comment: a review comment on a diff line, or a conversation comment.
+#[derive(Debug, Clone)]
+pub struct Comment {
+    pub id: u64,
+    pub author: String,
+    pub author_is_bot: bool,
+    pub body: String,
+    pub created: DateTime<Utc>,
+    pub url: String,
+    /// Review comments: the first comment of the thread this one replies to.
+    pub in_reply_to: Option<u64>,
+    pub path: Option<String>,
+    pub diff_hunk: Option<String>,
+}
+
+impl Comment {
+    fn from_json(v: &Value) -> Self {
+        Self {
+            id: v["id"].as_u64().unwrap_or_default(),
+            author: s(&v["user"]["login"]),
+            author_is_bot: v["user"]["type"] == "Bot" || s(&v["user"]["login"]).ends_with("[bot]"),
+            body: s(&v["body"]),
+            created: v["created_at"].as_str().and_then(|t| t.parse().ok()).unwrap_or_default(),
+            url: s(&v["html_url"]),
+            in_reply_to: v["in_reply_to_id"].as_u64(),
+            path: v["path"].as_str().map(String::from),
+            diff_hunk: v["diff_hunk"].as_str().map(String::from),
+        }
+    }
 }
 
 pub struct GitHub {
@@ -130,6 +164,7 @@ impl GitHub {
             head_ref: s(&v["head"]["ref"]),
             base_ref: s(&v["base"]["ref"]),
             draft: v["draft"].as_bool().unwrap_or(false),
+            open: v["state"] == "open",
             additions: v["additions"].as_u64().unwrap_or(0),
             deletions: v["deletions"].as_u64().unwrap_or(0),
             changed_files: v["changed_files"].as_u64().unwrap_or(0),
@@ -177,6 +212,54 @@ impl GitHub {
             return Ok(None);
         }
         Ok(String::from_utf8(bytes.to_vec()).ok())
+    }
+
+    /// Review comments (on lines of the diff), oldest first, at most 300.
+    pub async fn review_comments(&self, pr: &PrRef) -> Result<Vec<Comment>> {
+        let mut out = Vec::new();
+        for page in 1..=3 {
+            let v = self.get_json(&pr.api(&format!("/comments?per_page=100&page={page}"))).await?;
+            let items = v.as_array().cloned().unwrap_or_default();
+            out.extend(items.iter().map(Comment::from_json));
+            if items.len() < 100 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Conversation comments on the PR, oldest first, at most 300.
+    pub async fn issue_comments(&self, pr: &PrRef) -> Result<Vec<Comment>> {
+        let mut out = Vec::new();
+        for page in 1..=3 {
+            let url = format!("{API}/repos/{}/{}/issues/{}/comments?per_page=100&page={page}", pr.owner, pr.repo, pr.number);
+            let v = self.get_json(&url).await?;
+            let items = v.as_array().cloned().unwrap_or_default();
+            out.extend(items.iter().map(Comment::from_json));
+            if items.len() < 100 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Replies in the thread of review comment `comment_id`. Returns the reply's URL.
+    pub async fn reply_to_review_comment(&self, pr: &PrRef, comment_id: u64, body: &str) -> Result<String> {
+        let resp = self
+            .req(Method::POST, pr.api(&format!("/comments/{comment_id}/replies")), "application/vnd.github+json")
+            .json(&json!({ "body": body }))
+            .send()
+            .await?;
+        let v: Value = ok(resp).await?.json().await?;
+        Ok(s(&v["html_url"]))
+    }
+
+    /// Adds a conversation comment to the PR. Returns its URL.
+    pub async fn comment(&self, pr: &PrRef, body: &str) -> Result<String> {
+        let url = format!("{API}/repos/{}/{}/issues/{}/comments", pr.owner, pr.repo, pr.number);
+        let resp = self.req(Method::POST, url, "application/vnd.github+json").json(&json!({ "body": body })).send().await?;
+        let v: Value = ok(resp).await?.json().await?;
+        Ok(s(&v["html_url"]))
     }
 
     /// Posts a PR review with event COMMENT (never APPROVE / REQUEST_CHANGES), with optional inline comments.

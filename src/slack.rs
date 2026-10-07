@@ -49,6 +49,27 @@ impl Slack {
         v["url"].as_str().map(String::from).context("no Socket Mode URL returned")
     }
 
+    /// `auth.test` for the bot token, plus the scopes the token was granted.
+    pub async fn auth_test(&self) -> Result<(Value, Vec<String>)> {
+        let resp = self
+            .http
+            .post("https://slack.com/api/auth.test")
+            .bearer_auth(&self.bot_token)
+            .send()
+            .await?;
+        let scopes = resp
+            .headers()
+            .get("x-oauth-scopes")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+            .unwrap_or_default();
+        let v: Value = resp.json().await?;
+        if v["ok"].as_bool() != Some(true) {
+            bail!("Slack auth.test failed: {}", v["error"].as_str().unwrap_or("unknown error"));
+        }
+        Ok((v, scopes))
+    }
+
     pub async fn open_dm(&self, user: &str) -> Result<String> {
         let v = self.api("conversations.open", json!({ "users": user })).await?;
         v["channel"]["id"].as_str().map(String::from).context("conversations.open returned no channel")
@@ -94,32 +115,4 @@ impl Slack {
 /// Escapes text for Slack mrkdwn.
 pub fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-}
-
-/// Splits Markdown into chunks of at most ~`max` chars on line boundaries,
-/// closing and reopening code fences that span a split.
-pub fn chunk_markdown(text: &str, max: usize) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut cur = String::new();
-    let mut in_fence = false;
-    for line in text.lines() {
-        if !cur.is_empty() && cur.len() + line.len() + 8 > max {
-            if in_fence {
-                cur.push_str("```\n");
-            }
-            chunks.push(std::mem::take(&mut cur));
-            if in_fence {
-                cur.push_str("```\n");
-            }
-        }
-        cur.push_str(line);
-        cur.push('\n');
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-        }
-    }
-    if !cur.trim().is_empty() {
-        chunks.push(cur);
-    }
-    chunks
 }

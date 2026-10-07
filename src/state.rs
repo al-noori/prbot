@@ -1,3 +1,4 @@
+use crate::claude::{self, Settings};
 use crate::review::InlineComment;
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, Utc, Weekday};
@@ -99,6 +100,27 @@ pub struct StoredReview {
     pub posted_url: Option<String>,
 }
 
+/// A PR whose posted review is followed up: new commits get a re-review, replies get an answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Watch {
+    pub pr_url: String,
+    /// Head commit of the last review.
+    pub reviewed_sha: String,
+    /// Body of the last posted review, so a re-review knows what was said before.
+    #[serde(default)]
+    pub last_review: String,
+    /// Comments created before this were already looked at.
+    pub checked: DateTime<Utc>,
+    /// Comment IDs already answered (or deliberately skipped).
+    #[serde(default)]
+    pub handled: Vec<u64>,
+    /// When replies were posted, for the per-day cap.
+    #[serde(default)]
+    pub replies: Vec<DateTime<Utc>>,
+    /// Last review or reply; PRs without activity for a while stop being followed.
+    pub active: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
@@ -117,6 +139,13 @@ pub struct State {
     pub reviewed: HashMap<String, String>,
     /// Review id -> review, so the "Post as PR comment" button can find it.
     pub reviews: HashMap<String, StoredReview>,
+    /// Claude model and effort chosen in Slack; `None` falls back to CLAUDE_MODEL / CLAUDE_EFFORT or the defaults.
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// Re-review new commits and answer replies on PRs with a posted review.
+    pub followup: bool,
+    /// "owner/repo#123" -> follow-up state.
+    pub watched: HashMap<String, Watch>,
 }
 
 impl Default for State {
@@ -131,11 +160,31 @@ impl Default for State {
             last_check: None,
             reviewed: HashMap::new(),
             reviews: HashMap::new(),
+            model: None,
+            effort: None,
+            followup: false,
+            watched: HashMap::new(),
         }
     }
 }
 
 impl State {
+    pub fn settings(&self) -> Settings {
+        let env = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        Settings {
+            model: self
+                .model
+                .clone()
+                .or_else(|| env("CLAUDE_MODEL").and_then(|m| claude::resolve_model(&m)))
+                .unwrap_or_else(|| claude::DEFAULT_MODEL.into()),
+            effort: self
+                .effort
+                .clone()
+                .or_else(|| env("CLAUDE_EFFORT").filter(|e| claude::EFFORTS.contains(&e.as_str())))
+                .unwrap_or_else(|| claude::DEFAULT_EFFORT.into()),
+        }
+    }
+
     pub fn window(&self) -> Window {
         let parse = |t: &str| NaiveTime::parse_from_str(t, "%H:%M").ok();
         Window {

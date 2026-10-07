@@ -13,10 +13,9 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
-const MARKDOWN_CHUNK: usize = 11_000;
 const PARALLEL_REVIEWS: usize = 2;
 
-const HELP: &str = "*PR Reviewer*: Claude (Opus 5.5, effort medium) reviews PRs that request your review, posts the review on the PR (marked as not reviewed by you) and sends you a summary here. It never approves or merges.
+const HELP: &str = "*PR Reviewer*: Claude reviews PRs that request your review, posts the review on the PR (marked as not reviewed by you) and sends you a summary here. It never approves or merges.
 `/prreview` or `/prreview status`: show status
 `/prreview on` / `/prreview off`: turn scheduled checks on or off (manual reviews always work)
 `/prreview now`: check for review requests right now
@@ -25,6 +24,9 @@ const HELP: &str = "*PR Reviewer*: Claude (Opus 5.5, effort medium) reviews PRs 
 `/prreview hours 08:00-18:00` / `/prreview hours off`: only run scheduled checks within working hours
 `/prreview weekdays on|off`: skip weekends or not
 `/prreview autopost on|off`: post reviews to the PR automatically, or only when you click
+`/prreview followup on|off`: on PRs with a posted review, re-review new commits and answer replies to Claude's comments and @mentions of you right away
+`/prreview model opus|sonnet|haiku|fable`: choose the Claude model (or a full model ID)
+`/prreview effort low|medium|high|xhigh|max`: how hard Claude thinks
 `/prreview scope me|team`: only PRs requesting you directly, or also through your teams
 `/prreview <PR URL>`: review one PR now (you can also just DM me the link)";
 
@@ -71,7 +73,7 @@ impl Bot {
             _ => Ok(()),
         };
         if let Err(e) = result {
-            eprintln!("error handling {kind}: {e:#}");
+            crate::log(&format!("error handling {kind}: {e:#}"));
             let _ = self.slack.post(&self.dm, &format!(":warning: {e:#}"), None, None).await;
         }
     }
@@ -79,7 +81,7 @@ impl Bot {
     async fn on_slash(self: &Arc<Self>, p: Value) -> Result<()> {
         let response_url = p["response_url"].as_str().unwrap_or_default().to_string();
         let reply = if p["user_id"] != self.owner.as_str() {
-            "Sorry, this PR reviewer is private.".to_string()
+            self.not_yours()
         } else {
             self.command(p["text"].as_str().unwrap_or_default()).await?
         };
@@ -89,8 +91,23 @@ impl Bot {
     async fn on_event(self: &Arc<Self>, p: Value) -> Result<()> {
         let ev = &p["event"];
         let from_owner = ev["user"] == self.owner.as_str();
+        let human_dm = ev["channel_type"] == "im" && ev.get("bot_id").is_none() && ev.get("subtype").is_none();
         match ev["type"].as_str().unwrap_or_default() {
             "app_home_opened" if from_owner && ev["tab"] == "home" => self.refresh_home().await,
+            // Someone else found the app: explain whose it is and how to get one.
+            "app_home_opened" if ev["tab"] == "home" => {
+                if let Some(user) = ev["user"].as_str() {
+                    let view = json!({ "type": "home", "blocks": [
+                        { "type": "section", "text": { "type": "mrkdwn", "text": self.not_yours() } }
+                    ] });
+                    self.slack.publish_home(user, view).await?;
+                }
+            }
+            "message" if !from_owner && human_dm => {
+                if let Some(channel) = ev["channel"].as_str() {
+                    self.slack.post(channel, &self.not_yours(), None, None).await?;
+                }
+            }
             "message"
                 if from_owner
                     && ev["channel_type"] == "im"
@@ -131,10 +148,13 @@ impl Bot {
                 "toggle" => {
                     self.command(if a["value"] == "on" { "on" } else { "off" }).await?;
                 }
+                "followup" => {
+                    self.command(if a["value"] == "on" { "followup on" } else { "followup off" }).await?;
+                }
                 "check_now" => {
                     self.command("now").await?;
                 }
-                "set_schedule" => {
+                "set_schedule" | "set_model" | "set_effort" => {
                     if let Some(v) = a["selected_option"]["value"].as_str() {
                         self.command(v).await?;
                     }
@@ -231,6 +251,44 @@ impl Bot {
                 }
                 _ => "Use `autopost on` or `autopost off`.".into(),
             },
+            "followup" | "follow-up" => match arg.as_str() {
+                "on" | "off" => {
+                    let on = arg == "on";
+                    self.store.update(|s| s.followup = on)?;
+                    if on {
+                        format!(
+                            "Follow-ups are *on*. On PRs with a posted review, new commits get a re-review and replies to Claude's comments (or @mentions of you) get an answer, checked every 2 minutes within your working hours. {} PR(s) are being followed.",
+                            self.store.get().watched.len()
+                        )
+                    } else {
+                        "Follow-ups are *off*.".into()
+                    }
+                }
+                _ => "Use `followup on` or `followup off`.".into(),
+            },
+            "model" => match claude::resolve_model(&arg) {
+                Some(model) if !arg.is_empty() => {
+                    self.store.update(|s| s.model = Some(model))?;
+                    format!("Reviews now use {}.", self.store.get().settings().describe())
+                }
+                _ => format!(
+                    "Use `model opus`, `model sonnet`, `model haiku`, `model fable`, or a full model ID. Now: {}.",
+                    self.store.get().settings().describe()
+                ),
+            },
+            "effort" => {
+                if claude::EFFORTS.contains(&arg.as_str()) {
+                    self.store.update(|s| s.effort = Some(arg.clone()))?;
+                    let settings = self.store.get().settings();
+                    if settings.uses_effort() {
+                        format!("Reviews now use {}.", settings.describe())
+                    } else {
+                        format!("Saved. {} has no effort setting, so it applies once you switch models.", claude::model_label(&settings.model))
+                    }
+                } else {
+                    format!("Use `effort {}`.", claude::EFFORTS.join("|"))
+                }
+            }
             "scope" => {
                 let query = match arg.as_str() {
                     "me" => Some("user-review-requested:@me"),
@@ -251,21 +309,34 @@ impl Bot {
         Ok(reply)
     }
 
+    /// What everyone except the owner sees.
+    fn not_yours(&self) -> String {
+        format!(
+            "This is <@{}>'s personal PR reviewer, so it only works for them. To get your own, which reviews the PRs that request *your* review using your GitHub and Claude accounts, follow the quickstart at {} (about 5 minutes).",
+            self.owner,
+            env!("CARGO_PKG_REPOSITORY")
+        )
+    }
+
     pub fn status_text(&self) -> String {
         let st = self.store.get();
         let next = *self.next_run.lock().unwrap();
         let in_flight = self.in_flight.lock().unwrap().len();
         format!(
-            "*Scheduled checks:* {}\n*Schedule:* {}, {}\n*Next check:* {}\n*Last check:* {}\n*Posting:* {}\n*Scope:* {}\n*Model:* `{}`, effort `{}`, via {}\n*Reviews running:* {}",
+            "*Scheduled checks:* {}\n*Schedule:* {}, {}\n*Next check:* {}\n*Last check:* {}\n*Posting:* {}\n*Follow-ups:* {}\n*Scope:* {}\n*Model:* {} via {}\n*Reviews running:* {}",
             if st.enabled { ":large_green_circle: on" } else { ":white_circle: off" },
             st.schedule.describe(),
             st.window().describe(),
             next.map(fmt_time).unwrap_or_else(|| "none".into()),
             st.last_check.map(fmt_time).unwrap_or_else(|| "never".into()),
             if st.autopost { "automatically to the PR, marked as not reviewed by you" } else { "only when you click Post to PR" },
+            if st.followup {
+                format!("on, following {} PR(s): re-review new commits, answer replies", st.watched.len())
+            } else {
+                "off".into()
+            },
             scope_label(&st.query),
-            claude::MODEL,
-            claude::EFFORT,
+            st.settings().describe(),
             self.claude.describe(),
             in_flight,
         )
@@ -390,7 +461,13 @@ impl Bot {
             .slack
             .post(&self.dm, &format!(":hourglass_flowing_sand: Reviewing <{}|{}> with Claude…", pr.url(), pr.key()), None, None)
             .await?;
-        let review = match review::run(&self.gh, &self.claude, pr).await {
+        let st = self.store.get();
+        // On a followed PR with new commits, Claude sees its previous review and focuses on what changed.
+        let previous = match st.watched.get(&pr.key()) {
+            Some(w) if st.reviewed.get(&pr.key()) != Some(&self.gh.pr(pr).await?.head_sha) => Some(w.last_review.clone()),
+            _ => None,
+        };
+        let review = match review::run(&self.gh, &self.claude, &st.settings(), pr, previous.as_deref()).await {
             Ok(r) => r,
             Err(e) => {
                 let msg = format!(":warning: Review of <{}|{}> failed: {e:#}", pr.url(), pr.key());
@@ -425,6 +502,7 @@ impl Bot {
                             r.posted_url = Some(url.clone());
                         }
                     })?;
+                    self.watch(pr, &review.info.head_sha, &gh_body)?;
                     posted = Some(url);
                 }
                 Err(e) => {
@@ -436,19 +514,7 @@ impl Bot {
         }
 
         let (text, blocks) = header_blocks(&review, &id, posted.as_deref());
-        self.slack.update(&self.dm, &ts, &text, Some(blocks)).await?;
-        let chunks = slack::chunk_markdown(&review.markdown(), MARKDOWN_CHUNK);
-        for (i, chunk) in chunks.iter().enumerate() {
-            self.slack
-                .post(
-                    &self.dm,
-                    &format!("Review part {}/{}", i + 1, chunks.len()),
-                    Some(json!([{ "type": "markdown", "text": chunk }])),
-                    Some(&ts),
-                )
-                .await?;
-        }
-        Ok(())
+        self.slack.update(&self.dm, &ts, &text, Some(blocks)).await
     }
 
     /// Runs on a confirmed button click (when autopost is off or failed). Posts a COMMENT review, never an approval.
@@ -469,6 +535,7 @@ impl Bot {
                         r.posted_url = Some(url.clone());
                     }
                 })?;
+                self.watch(&pr, &stored.head_sha, &stored.body)?;
                 url
             }
         };
@@ -485,7 +552,8 @@ impl Bot {
     // ---------- App Home tab ----------
 
     pub async fn refresh_home(&self) {
-        let enabled = self.store.get().enabled;
+        let st = self.store.get();
+        let enabled = st.enabled;
         let toggle = if enabled {
             json!({ "type": "button", "action_id": "toggle", "value": "off", "style": "danger",
                     "text": { "type": "plain_text", "text": "Turn off" } })
@@ -494,6 +562,24 @@ impl Bot {
                     "text": { "type": "plain_text", "text": "Turn on" } })
         };
         let opt = |label: &str, value: &str| json!({ "text": { "type": "plain_text", "text": label }, "value": value });
+        let followup = if st.followup {
+            json!({ "type": "button", "action_id": "followup", "value": "off",
+                    "text": { "type": "plain_text", "text": "Follow-ups: on" } })
+        } else {
+            json!({ "type": "button", "action_id": "followup", "value": "on",
+                    "text": { "type": "plain_text", "text": "Follow-ups: off" } })
+        };
+        let settings = st.settings();
+        let model_opts: Vec<Value> = claude::MODELS.iter().map(|(short, _, label)| opt(label, &format!("model {short}"))).collect();
+        let mut model_select = json!({ "type": "static_select", "action_id": "set_model",
+            "placeholder": { "type": "plain_text", "text": "Model" }, "options": model_opts });
+        if let Some((short, _, label)) = claude::MODELS.iter().find(|(_, id, _)| *id == settings.model) {
+            model_select["initial_option"] = opt(label, &format!("model {short}"));
+        }
+        let effort_opts: Vec<Value> = claude::EFFORTS.iter().map(|e| opt(&format!("Effort: {e}"), &format!("effort {e}"))).collect();
+        let effort_select = json!({ "type": "static_select", "action_id": "set_effort",
+            "placeholder": { "type": "plain_text", "text": "Effort" }, "options": effort_opts,
+            "initial_option": opt(&format!("Effort: {}", settings.effort), &format!("effort {}", settings.effort)) });
         let view = json!({
             "type": "home",
             "blocks": [
@@ -513,6 +599,7 @@ impl Bot {
                           opt("At 09:00 and 14:00", "at 09:00,14:00"),
                       ] }
                 ] },
+                { "type": "actions", "elements": [model_select, effort_select, followup] },
                 { "type": "divider" },
                 { "type": "input", "block_id": "manual", "dispatch_action": true,
                   "label": { "type": "plain_text", "text": "Review a PR now" },
@@ -524,7 +611,7 @@ impl Bot {
             ]
         });
         if let Err(e) = self.slack.publish_home(&self.owner, view).await {
-            eprintln!("could not update the Home tab: {e:#}");
+            crate::log(&format!("could not update the Home tab: {e:#}"));
         }
     }
 }
@@ -536,10 +623,12 @@ fn header_blocks(r: &Review, id: &str, posted: Option<&str>) -> (String, Value) 
     let what = format!("summary + {inline} inline comment{}", if inline == 1 { "" } else { "s" });
     let mut blocks = vec![
         json!({ "type": "section", "text": { "type": "mrkdwn", "text": format!(
-            "*<{}|{}>* {}\n*Verdict:* {}", r.pr.url(), r.pr.key(), slack::esc(&i.title), slack::esc(&r.verdict)) } }),
+            "*<{}|{}>* {}{}\n*Verdict:* {}\n{}", r.pr.url(), r.pr.key(), slack::esc(&i.title),
+            if r.rereview { " _(re-review after new commits)_" } else { "" },
+            slack::esc(&r.verdict), slack::esc(&r.slack_summary())).chars().take(2900).collect::<String>() } }),
         json!({ "type": "context", "elements": [{ "type": "mrkdwn", "text": format!(
-            "by {} · +{} −{} in {} files · `{}` effort {} · {} · full review in the thread",
-            slack::esc(&i.author), i.additions, i.deletions, i.changed_files, r.model, claude::EFFORT, r.cost_label()) }] }),
+            "by {} · +{} −{} in {} files · {} · {}",
+            slack::esc(&i.author), i.additions, i.deletions, i.changed_files, r.settings.describe(), r.cost_label()) }] }),
     ];
     if !r.notes.is_empty() {
         let notes: String = slack::esc(&r.notes.join(" ")).chars().take(2800).collect();
