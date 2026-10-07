@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::github::{GitHub, PrRef};
 use crate::review::{self, Review};
 use crate::slack::{self, Slack};
-use crate::state::{is_weekend, Schedule, Store, StoredReview};
+use crate::state::{Schedule, Store, StoredReview, WorkHours};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, NaiveTime, Utc};
 use serde_json::{json, Value};
@@ -16,13 +16,15 @@ use tokio::sync::Semaphore;
 const MARKDOWN_CHUNK: usize = 11_000;
 const PARALLEL_REVIEWS: usize = 2;
 
-const HELP: &str = "*PR Reviewer*: Claude (Opus 5.5, effort medium) reviews PRs that request your review and posts the result here. It never approves or merges.
+const HELP: &str = "*PR Reviewer*: Claude (Opus 5.5, effort medium) reviews PRs that request your review, posts the review on the PR (marked as not reviewed by you) and sends you a summary here. It never approves or merges.
 `/prreview` or `/prreview status`: show status
 `/prreview on` / `/prreview off`: turn scheduled checks on or off (manual reviews always work)
 `/prreview now`: check for review requests right now
 `/prreview every 30m` / `/prreview every 2h`: check on an interval
 `/prreview at 09:00,14:00`: check at fixed times
+`/prreview hours 08:00-18:00` / `/prreview hours off`: only run scheduled checks within working hours
 `/prreview weekdays on|off`: skip weekends or not
+`/prreview autopost on|off`: post reviews to the PR automatically, or only when you click
 `/prreview scope me|team`: only PRs requesting you directly, or also through your teams
 `/prreview <PR URL>`: review one PR now (you can also just DM me the link)";
 
@@ -208,6 +210,27 @@ impl Bot {
                 }
                 _ => "Use `weekdays on` (skip weekends) or `weekdays off`.".into(),
             },
+            "hours" => match parse_hours(&arg) {
+                Some(hours) => {
+                    let desc = hours.as_ref().map(|h| format!("{}–{}", h.start, h.end)).unwrap_or_else(|| "all day".into());
+                    self.store.update(|s| s.work_hours = hours)?;
+                    self.reschedule();
+                    format!("Working hours are now {desc}.\n{}", self.status_text())
+                }
+                None => "Use e.g. `hours 08:00-18:00`, or `hours off` to check all day.".into(),
+            },
+            "autopost" => match arg.as_str() {
+                "on" | "off" => {
+                    let on = arg == "on";
+                    self.store.update(|s| s.autopost = on)?;
+                    if on {
+                        "Reviews are now posted to the PR automatically, marked as written by Claude and not reviewed by you.".into()
+                    } else {
+                        "Reviews now only go to Slack. Use the *Post to PR* button to post one.".into()
+                    }
+                }
+                _ => "Use `autopost on` or `autopost off`.".into(),
+            },
             "scope" => {
                 let query = match arg.as_str() {
                     "me" => Some("user-review-requested:@me"),
@@ -233,12 +256,13 @@ impl Bot {
         let next = *self.next_run.lock().unwrap();
         let in_flight = self.in_flight.lock().unwrap().len();
         format!(
-            "*Scheduled checks:* {}\n*Schedule:* {}{}\n*Next check:* {}\n*Last check:* {}\n*Scope:* {}\n*Model:* `{}`, effort `{}`, via {}\n*Reviews running:* {}",
+            "*Scheduled checks:* {}\n*Schedule:* {}, {}\n*Next check:* {}\n*Last check:* {}\n*Posting:* {}\n*Scope:* {}\n*Model:* `{}`, effort `{}`, via {}\n*Reviews running:* {}",
             if st.enabled { ":large_green_circle: on" } else { ":white_circle: off" },
             st.schedule.describe(),
-            if st.weekdays_only { " (weekdays only)" } else { "" },
+            st.window().describe(),
             next.map(fmt_time).unwrap_or_else(|| "none".into()),
             st.last_check.map(fmt_time).unwrap_or_else(|| "never".into()),
+            if st.autopost { "automatically to the PR, marked as not reviewed by you" } else { "only when you click Post to PR" },
             scope_label(&st.query),
             claude::MODEL,
             claude::EFFORT,
@@ -252,7 +276,7 @@ impl Bot {
     pub fn reschedule(&self) {
         let st = self.store.get();
         *self.next_run.lock().unwrap() =
-            if st.enabled { st.schedule.next_after(Local::now(), st.weekdays_only) } else { None };
+            if st.enabled { st.schedule.next_after(Local::now(), &st.window()) } else { None };
     }
 
     /// Ticks every 20 s. A check that was due while the machine slept runs once on wake-up.
@@ -270,18 +294,19 @@ impl Bot {
                 } else {
                     match *next {
                         None => {
-                            *next = st.schedule.next_after(now, st.weekdays_only);
+                            *next = st.schedule.next_after(now, &st.window());
                             false
                         }
                         Some(t) if now >= t => {
-                            *next = st.schedule.next_after(now, st.weekdays_only);
+                            *next = st.schedule.next_after(now, &st.window());
                             true
                         }
                         Some(_) => false,
                     }
                 }
             };
-            if due && !(st.weekdays_only && is_weekend(&now)) {
+            // A check that was due while the machine slept still has to fall inside working hours.
+            if due && st.window().contains(&now) {
                 tokio::spawn(self.clone().check_requests(false));
             }
         }
@@ -296,40 +321,44 @@ impl Bot {
         }
     }
 
+    /// Lists every PR requesting your review in a DM, and starts reviews for the ones that need one.
     async fn try_check(self: &Arc<Self>, manual: bool) -> Result<()> {
         let st = self.store.get();
         let prs = self.gh.review_requests(&st.query).await?;
-        let total = prs.len();
-        let (mut queued, mut up_to_date, mut drafts, mut deferred) = (0, 0, 0, 0);
+        let mut lines = Vec::new();
+        let mut queued = 0;
         for pr in prs {
-            if queued >= self.cfg.max_reviews_per_run {
-                deferred += 1;
-                continue;
-            }
             let info = self.gh.pr(&pr).await?;
-            if info.draft && self.cfg.skip_drafts {
-                drafts += 1;
+            let status = if info.draft && self.cfg.skip_drafts {
+                "draft, skipped"
             } else if st.reviewed.get(&pr.key()) == Some(&info.head_sha) {
-                up_to_date += 1;
-            } else if self.spawn_review(pr) {
+                "already reviewed at the latest commit"
+            } else if self.in_flight.lock().unwrap().contains(&pr.key()) {
+                "review running"
+            } else if queued >= self.cfg.max_reviews_per_run {
+                "waiting for the next check (limit per check reached)"
+            } else if self.spawn_review(pr.clone()) {
                 queued += 1;
-            }
+                "reviewing now"
+            } else {
+                "review running"
+            };
+            lines.push(format!(
+                "• <{}|{}> {} (by {}): _{status}_",
+                pr.url(),
+                pr.key(),
+                slack::esc(&info.title),
+                slack::esc(&info.author)
+            ));
         }
         self.store.update(|s| s.last_check = Some(Local::now()))?;
-        if manual || queued > 0 || deferred > 0 {
-            let mut msg = format!(":mag: {total} open PR(s) request your review. Reviewing {queued} now");
-            if up_to_date > 0 {
-                msg += &format!(", {up_to_date} already reviewed at their latest commit");
-            }
-            if drafts > 0 {
-                msg += &format!(", {drafts} draft(s) skipped");
-            }
-            if deferred > 0 {
-                msg += &format!(", {deferred} left for the next check (limit {} per run)", self.cfg.max_reviews_per_run);
-            }
-            msg.push('.');
-            self.slack.post(&self.dm, &msg, None, None).await?;
-        }
+        let header = if manual { "Check requested by you" } else { "Scheduled check" };
+        let msg = if lines.is_empty() {
+            format!(":clipboard: *{header}:* no open PRs request your review right now.")
+        } else {
+            format!(":clipboard: *{header}: {} PR(s) request your review*\n{}", lines.len(), lines.join("\n"))
+        };
+        self.slack.post(&self.dm, &msg, None, None).await?;
         self.refresh_home().await;
         Ok(())
     }
@@ -371,13 +400,15 @@ impl Bot {
         };
 
         let id = format!("r{}", Utc::now().timestamp_millis());
+        let (gh_body, comments) = review.github_review(&self.gh_login);
         self.store.update(|s| {
             s.reviews.insert(
                 id.clone(),
                 StoredReview {
                     pr_url: pr.url(),
                     head_sha: review.info.head_sha.clone(),
-                    body: review.body.clone(),
+                    body: gh_body.clone(),
+                    comments: comments.clone(),
                     created: Utc::now(),
                     posted_url: None,
                 },
@@ -385,9 +416,28 @@ impl Bot {
             s.reviewed.insert(pr.key(), review.info.head_sha.clone());
         })?;
 
-        let (text, blocks) = header_blocks(&review, &id);
+        let mut posted = None;
+        if self.store.get().autopost {
+            match self.gh.post_review(pr, &review.info.head_sha, &gh_body, &comments).await {
+                Ok(url) => {
+                    self.store.update(|s| {
+                        if let Some(r) = s.reviews.get_mut(&id) {
+                            r.posted_url = Some(url.clone());
+                        }
+                    })?;
+                    posted = Some(url);
+                }
+                Err(e) => {
+                    self.slack
+                        .post(&self.dm, &format!(":warning: Couldn't post the review to the PR: {e:#}. Use the *Post to PR* button to try again."), None, None)
+                        .await?;
+                }
+            }
+        }
+
+        let (text, blocks) = header_blocks(&review, &id, posted.as_deref());
         self.slack.update(&self.dm, &ts, &text, Some(blocks)).await?;
-        let chunks = slack::chunk_markdown(&review.body, MARKDOWN_CHUNK);
+        let chunks = slack::chunk_markdown(&review.markdown(), MARKDOWN_CHUNK);
         for (i, chunk) in chunks.iter().enumerate() {
             self.slack
                 .post(
@@ -401,7 +451,7 @@ impl Bot {
         Ok(())
     }
 
-    /// Only runs on an explicit, confirmed button click. Posts a COMMENT review, never an approval.
+    /// Runs on a confirmed button click (when autopost is off or failed). Posts a COMMENT review, never an approval.
     async fn post_to_github(&self, p: &Value, id: &str) -> Result<()> {
         let channel = p["container"]["channel_id"].as_str().unwrap_or(&self.dm).to_string();
         let ts = p["container"]["message_ts"].as_str().unwrap_or_default().to_string();
@@ -413,11 +463,7 @@ impl Bot {
             Some(url) => url.clone(),
             None => {
                 let pr = PrRef::parse(&stored.pr_url).context("stored review has an invalid PR URL")?;
-                let body = format!(
-                    "{}\n\n---\n<sub>🤖 Review written by Claude ({}, effort {}) and posted by @{}. This is a comment, not an approval.</sub>",
-                    stored.body, claude::MODEL, claude::EFFORT, self.gh_login
-                );
-                let url = self.gh.post_comment_review(&pr, &stored.head_sha, &body).await?;
+                let url = self.gh.post_review(&pr, &stored.head_sha, &stored.body, &stored.comments).await?;
                 self.store.update(|s| {
                     if let Some(r) = s.reviews.get_mut(id) {
                         r.posted_url = Some(url.clone());
@@ -430,7 +476,7 @@ impl Bot {
         blocks.retain(|b| b["type"] != "actions");
         blocks.push(json!({
             "type": "context",
-            "elements": [{ "type": "mrkdwn", "text": format!(":white_check_mark: Posted as a PR comment: <{link}|view on GitHub>") }]
+            "elements": [{ "type": "mrkdwn", "text": format!(":white_check_mark: Posted to the PR: <{link}|view on GitHub>") }]
         }));
         let text = p["message"]["text"].as_str().unwrap_or("PR review").to_string();
         self.slack.update(&channel, &ts, &text, Some(Value::Array(blocks))).await
@@ -474,7 +520,7 @@ impl Bot {
                                "placeholder": { "type": "plain_text", "text": "https://github.com/org/repo/pull/123, then press Enter" },
                                "dispatch_action_config": { "trigger_actions_on": ["on_enter_pressed"] } } },
                 { "type": "context", "elements": [{ "type": "mrkdwn", "text":
-                    "You can also DM me a PR link or use `/prreview help`. Reviews are posted only here in Slack. Posting one to GitHub takes your click, and it is always a comment, never an approval or a merge." }] }
+                    "You can also DM me a PR link or use `/prreview help`. Reviews posted to GitHub are always comments marked as written by Claude and not reviewed by you, never an approval or a merge." }] }
             ]
         });
         if let Err(e) = self.slack.publish_home(&self.owner, view).await {
@@ -483,9 +529,11 @@ impl Bot {
     }
 }
 
-fn header_blocks(r: &Review, id: &str) -> (String, Value) {
+fn header_blocks(r: &Review, id: &str, posted: Option<&str>) -> (String, Value) {
     let i = &r.info;
     let text = format!("{}: {}", r.pr.key(), r.verdict);
+    let inline = r.inline_count();
+    let what = format!("summary + {inline} inline comment{}", if inline == 1 { "" } else { "s" });
     let mut blocks = vec![
         json!({ "type": "section", "text": { "type": "mrkdwn", "text": format!(
             "*<{}|{}>* {}\n*Verdict:* {}", r.pr.url(), r.pr.key(), slack::esc(&i.title), slack::esc(&r.verdict)) } }),
@@ -497,22 +545,42 @@ fn header_blocks(r: &Review, id: &str) -> (String, Value) {
         let notes: String = slack::esc(&r.notes.join(" ")).chars().take(2800).collect();
         blocks.push(json!({ "type": "context", "elements": [{ "type": "mrkdwn", "text": format!(":information_source: {notes}") }] }));
     }
-    blocks.push(json!({
-        "type": "actions",
-        "elements": [
-            { "type": "button", "action_id": "post_to_github", "value": id,
-              "text": { "type": "plain_text", "text": "Post as PR comment" },
-              "confirm": {
-                  "title": { "type": "plain_text", "text": "Post to GitHub?" },
-                  "text": { "type": "mrkdwn", "text": "This posts the review on the PR as a *comment* from your GitHub account, visible to everyone with access. It does not approve or request changes." },
-                  "confirm": { "type": "plain_text", "text": "Post" },
-                  "deny": { "type": "plain_text", "text": "Cancel" }
-              } },
-            { "type": "button", "action_id": "rereview", "value": r.pr.url(),
-              "text": { "type": "plain_text", "text": "Re-review" } }
-        ]
-    }));
+    let rereview = json!({ "type": "button", "action_id": "rereview", "value": r.pr.url(),
+                           "text": { "type": "plain_text", "text": "Re-review" } });
+    match posted {
+        Some(url) => {
+            blocks.push(json!({ "type": "context", "elements": [{ "type": "mrkdwn", "text": format!(
+                ":white_check_mark: Posted to the PR ({what}), marked as not reviewed by you: <{url}|view on GitHub>") }] }));
+            blocks.push(json!({ "type": "actions", "elements": [rereview] }));
+        }
+        None => blocks.push(json!({
+            "type": "actions",
+            "elements": [
+                { "type": "button", "action_id": "post_to_github", "value": id,
+                  "text": { "type": "plain_text", "text": format!("Post to PR ({what})") },
+                  "confirm": {
+                      "title": { "type": "plain_text", "text": "Post to GitHub?" },
+                      "text": { "type": "mrkdwn", "text": "This posts the review on the PR as a *comment* from your GitHub account, marked as written by Claude and not reviewed by you. It does not approve or request changes." },
+                      "confirm": { "type": "plain_text", "text": "Post" },
+                      "deny": { "type": "plain_text", "text": "Cancel" }
+                  } },
+                rereview
+            ]
+        })),
+    }
     (text, Value::Array(blocks))
+}
+
+/// "08:00-18:00" -> Some(Some(hours)); "off" -> Some(None); anything else -> None.
+fn parse_hours(s: &str) -> Option<Option<WorkHours>> {
+    let s = s.trim();
+    if s == "off" || s == "all" {
+        return Some(None);
+    }
+    let (start, end) = s.split_once(['-', '–'])?;
+    let fmt = |t: &str| NaiveTime::parse_from_str(t.trim(), "%H:%M").ok().map(|t| t.format("%H:%M").to_string());
+    let (start, end) = (fmt(start)?, fmt(end)?);
+    (start != end).then_some(Some(WorkHours { start, end }))
 }
 
 fn scope_label(query: &str) -> &'static str {

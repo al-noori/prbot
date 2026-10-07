@@ -39,7 +39,8 @@ async fn main() -> Result<()> {
         let pr = args.get(2).and_then(|a| PrRef::parse(a)).context("usage: prbot review <GitHub PR URL>")?;
         eprintln!("Reviewing {} with {} (effort {}) via {}…", pr.key(), claude::MODEL, claude::EFFORT, claude.describe());
         let r = review::run(&gh, &claude, &pr).await?;
-        println!("Verdict: {}\n\n{}", r.verdict, r.body);
+        println!("Verdict: {}\n\n{}", r.verdict, r.markdown());
+        eprintln!("{} of {} finding(s) would be posted as inline comments.", r.inline_count(), r.findings.len());
         for note in &r.notes {
             eprintln!("note: {note}");
         }

@@ -1,8 +1,9 @@
 //! Minimal GitHub REST client.
 //!
 //! By design there is no function here to approve, request changes, or merge:
-//! the only write is `post_comment_review`, which always uses event "COMMENT".
+//! the only write is `post_review`, which always uses event "COMMENT".
 
+use crate::review::InlineComment;
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode, Url};
@@ -178,13 +179,26 @@ impl GitHub {
         Ok(String::from_utf8(bytes.to_vec()).ok())
     }
 
-    /// Posts `body` as a PR review with event COMMENT (never APPROVE / REQUEST_CHANGES).
-    pub async fn post_comment_review(&self, pr: &PrRef, commit_id: &str, body: &str) -> Result<String> {
-        let resp = self
-            .req(Method::POST, pr.api("/reviews"), "application/vnd.github+json")
-            .json(&json!({ "commit_id": commit_id, "body": body, "event": "COMMENT" }))
-            .send()
-            .await?;
+    /// Posts a PR review with event COMMENT (never APPROVE / REQUEST_CHANGES), with optional inline comments.
+    /// If GitHub rejects the inline comments, it retries once with them folded into the body.
+    pub async fn post_review(&self, pr: &PrRef, commit_id: &str, body: &str, comments: &[InlineComment]) -> Result<String> {
+        let inline: Vec<Value> = comments
+            .iter()
+            .map(|c| json!({ "path": c.path, "line": c.line, "side": "RIGHT", "body": c.body }))
+            .collect();
+        let send = |body: String, inline: Vec<Value>| {
+            self.req(Method::POST, pr.api("/reviews"), "application/vnd.github+json")
+                .json(&json!({ "commit_id": commit_id, "body": body, "event": "COMMENT", "comments": inline }))
+                .send()
+        };
+        let mut resp = send(body.to_string(), inline).await?;
+        if resp.status() == StatusCode::UNPROCESSABLE_ENTITY && !comments.is_empty() {
+            let mut folded = format!("{body}\n### Line comments\n");
+            for c in comments {
+                folded.push_str(&format!("`{}:{}`\n{}\n\n", c.path, c.line, c.body));
+            }
+            resp = send(folded, Vec::new()).await?;
+        }
         let v: Value = ok(resp).await?.json().await?;
         Ok(v["html_url"].as_str().map(String::from).unwrap_or_else(|| pr.url()))
     }

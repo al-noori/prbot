@@ -1,3 +1,4 @@
+use crate::review::InlineComment;
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, Utc, Weekday};
 use serde::{Deserialize, Serialize};
@@ -22,9 +23,10 @@ impl Schedule {
         }
     }
 
-    pub fn next_after(&self, now: DateTime<Local>, weekdays_only: bool) -> Option<DateTime<Local>> {
+    /// Next scheduled check after `now`, inside the active window.
+    pub fn next_after(&self, now: DateTime<Local>, window: &Window) -> Option<DateTime<Local>> {
         match self {
-            Schedule::Interval { minutes } => Some(now + Duration::minutes(*minutes as i64)),
+            Schedule::Interval { minutes } => window.next_active(now + Duration::minutes(*minutes as i64)),
             Schedule::Times { times } => {
                 let parsed: Vec<NaiveTime> = times
                     .iter()
@@ -36,22 +38,62 @@ impl Schedule {
                         parsed.iter().map(move |t| day.and_time(*t))
                     })
                     .filter_map(|naive| naive.and_local_timezone(Local).earliest())
-                    .filter(|dt| *dt > now && !(weekdays_only && is_weekend(dt)))
+                    .filter(|dt| *dt > now && window.contains(dt))
                     .min()
             }
         }
     }
 }
 
-pub fn is_weekend(dt: &DateTime<Local>) -> bool {
-    matches!(dt.weekday(), Weekday::Sat | Weekday::Sun)
+/// Local working hours, "HH:MM". `end` before `start` means the window runs past midnight.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkHours {
+    pub start: String,
+    pub end: String,
+}
+
+/// When scheduled checks may run.
+pub struct Window {
+    pub weekdays_only: bool,
+    pub hours: Option<(NaiveTime, NaiveTime)>,
+}
+
+impl Window {
+    pub fn contains(&self, dt: &DateTime<Local>) -> bool {
+        if self.weekdays_only && matches!(dt.weekday(), Weekday::Sat | Weekday::Sun) {
+            return false;
+        }
+        match self.hours {
+            None => true,
+            Some((start, end)) if start <= end => (start..end).contains(&dt.time()),
+            Some((start, end)) => dt.time() >= start || dt.time() < end,
+        }
+    }
+
+    /// The first moment at or after `dt` (to the minute) inside the window, looking up to 8 days ahead.
+    pub fn next_active(&self, dt: DateTime<Local>) -> Option<DateTime<Local>> {
+        (0..8 * 24 * 60)
+            .map(|m| dt + Duration::minutes(m))
+            .find(|t| self.contains(t))
+    }
+
+    pub fn describe(&self) -> String {
+        let days = if self.weekdays_only { "Mon–Fri" } else { "every day" };
+        match self.hours {
+            Some((s, e)) => format!("{days}, {}–{}", s.format("%H:%M"), e.format("%H:%M")),
+            None => format!("{days}, all day"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredReview {
     pub pr_url: String,
     pub head_sha: String,
+    /// Review body as posted to GitHub.
     pub body: String,
+    #[serde(default)]
+    pub comments: Vec<InlineComment>,
     pub created: DateTime<Utc>,
     #[serde(default)]
     pub posted_url: Option<String>,
@@ -64,6 +106,10 @@ pub struct State {
     pub enabled: bool,
     pub schedule: Schedule,
     pub weekdays_only: bool,
+    /// Scheduled checks only run inside these hours. `None` means all day.
+    pub work_hours: Option<WorkHours>,
+    /// Post reviews to GitHub automatically (marked as not reviewed by the owner), instead of on click.
+    pub autopost: bool,
     /// GitHub search qualifiers selecting the PRs to review.
     pub query: String,
     pub last_check: Option<DateTime<Local>>,
@@ -79,10 +125,22 @@ impl Default for State {
             enabled: false,
             schedule: Schedule::Interval { minutes: 60 },
             weekdays_only: true,
+            work_hours: Some(WorkHours { start: "08:00".into(), end: "18:00".into() }),
+            autopost: true,
             query: "user-review-requested:@me".into(),
             last_check: None,
             reviewed: HashMap::new(),
             reviews: HashMap::new(),
+        }
+    }
+}
+
+impl State {
+    pub fn window(&self) -> Window {
+        let parse = |t: &str| NaiveTime::parse_from_str(t, "%H:%M").ok();
+        Window {
+            weekdays_only: self.weekdays_only,
+            hours: self.work_hours.as_ref().and_then(|h| Some((parse(&h.start)?, parse(&h.end)?))),
         }
     }
 }
