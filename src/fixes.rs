@@ -410,7 +410,8 @@ impl Bot {
     /// A clean checkout of the PR head: `<home>/checkouts/<owner>/<repo>` holds a partial clone, and each PR
     /// gets its own worktree next to it, reset to the head commit every time.
     async fn checkout(&self, pr: &PrRef, info: &PrInfo) -> Result<PathBuf> {
-        let base = crate::config::home_dir().join("checkouts").join(&pr.owner).join(&pr.repo);
+        // Absolute, because the home directory can be "." and git -C would resolve the worktree path from the clone.
+        let base = std::path::absolute(crate::config::home_dir().join("checkouts").join(&pr.owner).join(&pr.repo))?;
         let wt = base.with_file_name(format!("{}-pr{}", pr.repo, pr.number));
         if !base.join(".git").exists() {
             std::fs::create_dir_all(&base)?;
