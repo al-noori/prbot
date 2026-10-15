@@ -1,6 +1,7 @@
 mod bot;
 mod claude;
 mod config;
+mod fixes;
 mod followup;
 mod github;
 mod guard;
@@ -58,7 +59,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         None => {}
-        Some("gh-guard") => guard::run(),
+        Some("gh-guard") => guard::run(args.get(2).map(String::as_str)),
         Some("setup") => return setup::setup(&http).await,
         Some("doctor") => return setup::doctor(&http).await,
         Some("review") => return review_once(&http, args.get(2)).await,
@@ -118,6 +119,7 @@ async fn main() -> Result<()> {
     bot.refresh_home().await;
     tokio::spawn(bot.clone().run_scheduler());
     tokio::spawn(bot.clone().run_followups());
+    tokio::spawn(bot.clone().run_fixes());
     tokio::spawn(bot.clone().run_heartbeat());
     tokio::spawn(bot.clone().run_forward_poller());
     log(&format!("prbot running for GitHub @{}\n{}", bot.gh_login, bot.status_text()));

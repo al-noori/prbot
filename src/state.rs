@@ -121,6 +121,50 @@ pub struct Watch {
     pub active: DateTime<Utc>,
 }
 
+/// One of your own open PRs, checked for review comments to fix.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OwnPr {
+    /// When prbot first saw the PR. Conversation comments from before are left alone.
+    pub since: DateTime<Utc>,
+    /// Comment IDs already drafted (and applied or skipped), so they aren't drafted again.
+    #[serde(default)]
+    pub handled: Vec<u64>,
+}
+
+/// Fixes and replies Claude drafted for review comments on your PR, waiting for Apply or Skip in Slack.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingFix {
+    pub pr_url: String,
+    /// Head commit the fix was drafted on. If the PR moves on, the draft is outdated.
+    pub base_sha: String,
+    pub head_ref: String,
+    pub head_repo: String,
+    /// `git diff --binary` of the change; empty when there are only replies.
+    pub patch: String,
+    pub stat: String,
+    pub commit_message: String,
+    pub items: Vec<FixItem>,
+    /// The Slack message with the Apply and Skip buttons.
+    pub slack_ts: String,
+    pub created: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FixItem {
+    /// Inline thread: its GraphQL ID (to resolve it) and its first comment (to reply in it).
+    pub thread_id: Option<String>,
+    pub reply_to: Option<u64>,
+    /// The comments this item covers, marked handled once applied or skipped.
+    pub comment_ids: Vec<u64>,
+    pub author: String,
+    /// Where it was ("src/a.rs:12", or "conversation") and the start of the comment, for Slack.
+    pub location: String,
+    pub excerpt: String,
+    /// "fixed", "reply" or "skip".
+    pub action: String,
+    pub reply: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
@@ -148,6 +192,12 @@ pub struct State {
     pub watched: HashMap<String, Watch>,
     /// "owner/repo#123" -> head commit when you marked the PR done. Done PRs aren't followed.
     pub done: HashMap<String, String>,
+    /// Draft fixes for review comments on your own PRs (applied only on click).
+    pub fixes: bool,
+    /// "owner/repo#123" -> your own open PR.
+    pub own: HashMap<String, OwnPr>,
+    /// Fix id -> draft waiting for Apply or Skip.
+    pub pending_fixes: HashMap<String, PendingFix>,
 }
 
 impl Default for State {
@@ -167,6 +217,9 @@ impl Default for State {
             followup: false,
             watched: HashMap::new(),
             done: HashMap::new(),
+            fixes: false,
+            own: HashMap::new(),
+            pending_fixes: HashMap::new(),
         }
     }
 }

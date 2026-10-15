@@ -3,6 +3,7 @@
 //! GitHub has no push channel without a public URL, so watched PRs are polled.
 
 use crate::bot::Bot;
+use crate::claude::Tools;
 use crate::github::{Comment, PrRef};
 use crate::review;
 use crate::slack;
@@ -245,7 +246,7 @@ impl Bot {
         ));
 
         let settings = self.store.get().settings();
-        let c = self.claude.complete(&settings, SYSTEM, &prompt, false).await?;
+        let c = self.claude.complete(&settings, SYSTEM, &prompt, Tools::None).await?;
         let text = c.text.trim();
         if text.is_empty() || text.contains("NO_REPLY") {
             // Nothing to say, but show it was read.

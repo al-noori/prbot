@@ -1,7 +1,7 @@
 //! Gathers PR context from GitHub, asks Claude for a structured review,
 //! and renders it for Slack and for GitHub (summary + inline comments).
 
-use crate::claude::{Claude, Settings};
+use crate::claude::{Claude, Settings, Tools};
 use crate::github::{GitHub, PrInfo, PrRef};
 use anyhow::Result;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -159,9 +159,9 @@ pub async fn run(gh: &GitHub, claude: &Claude, settings: &Settings, pr: &PrRef, 
         ));
     }
 
-    let repo_access = claude.has_repo_access();
+    let repo_access = claude.has_tools();
     let prompt = build_prompt(pr, &info, &context, &diff, &notes, previous, repo_access);
-    let c = claude.complete(settings, SYSTEM, &prompt, repo_access).await?;
+    let c = claude.complete(settings, SYSTEM, &prompt, if repo_access { Tools::ReadGh } else { Tools::None }).await?;
     if c.truncated {
         notes.push("The review hit the output limit and may be cut off.".into());
     }
