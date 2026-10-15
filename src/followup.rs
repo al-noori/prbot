@@ -245,7 +245,7 @@ impl Bot {
         ));
 
         let settings = self.store.get().settings();
-        let c = self.claude.complete(&settings, SYSTEM, &prompt).await?;
+        let c = self.claude.complete(&settings, SYSTEM, &prompt, false).await?;
         let text = c.text.trim();
         if text.is_empty() || text.contains("NO_REPLY") {
             // Nothing to say, but show it was read.

@@ -108,11 +108,17 @@ impl Claude {
         }
     }
 
-    pub async fn complete(&self, settings: &Settings, system: &str, user: &str) -> Result<Completion> {
+    /// With `repo_access`, Claude Code may run read-only `gh` commands to look at other repositories
+    /// (see `guard`). The API backend has no tools and ignores it.
+    pub async fn complete(&self, settings: &Settings, system: &str, user: &str, repo_access: bool) -> Result<Completion> {
         match &self.backend {
             Backend::Api { http, api_key } => complete_api(http, api_key, settings, system, user).await,
-            Backend::Cli { bin } => complete_cli(bin, settings, system, user).await,
+            Backend::Cli { bin } => complete_cli(bin, settings, system, user, repo_access).await,
         }
+    }
+
+    pub fn has_repo_access(&self) -> bool {
+        matches!(self.backend, Backend::Cli { .. })
     }
 }
 
@@ -185,17 +191,29 @@ async fn complete_api(http: &Client, api_key: &str, settings: &Settings, system:
     })
 }
 
-/// Runs `claude -p` with no tools, no MCP servers and no saved session; the prompt goes in on stdin.
-async fn complete_cli(bin: &str, settings: &Settings, system: &str, user: &str) -> Result<Completion> {
+/// Runs `claude -p` with no MCP servers and no saved session; the prompt goes in on stdin.
+/// Without `repo_access` it has no tools. With it, it has only Bash, and a command runs only when the
+/// PreToolUse hook `prbot gh-guard` allows it (read-only `gh`); `dontAsk` denies everything else.
+async fn complete_cli(bin: &str, settings: &Settings, system: &str, user: &str, repo_access: bool) -> Result<Completion> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(["-p", "--model", &settings.model]);
     if settings.uses_effort() {
         cmd.args(["--effort", &settings.effort]);
     }
+    if repo_access {
+        let exe = std::env::current_exe().context("could not find the prbot executable")?;
+        // Forward slashes and quotes, so the hook command also works in Git Bash on Windows.
+        let hook = format!("\"{}\" gh-guard", exe.display().to_string().replace('\\', "/"));
+        let hooks = json!({ "hooks": { "PreToolUse": [
+            { "matcher": "*", "hooks": [{ "type": "command", "command": hook }] }
+        ]}});
+        cmd.args(["--tools", "Bash", "--permission-mode", "dontAsk", "--settings", &hooks.to_string()]);
+    } else {
+        cmd.args(["--tools", ""]);
+    }
     let mut child = cmd
         .args([
             "--output-format", "json",
-            "--tools", "",
             "--strict-mcp-config",
             "--no-session-persistence",
             "--system-prompt", system,
