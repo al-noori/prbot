@@ -3,6 +3,7 @@ mod claude;
 mod config;
 mod followup;
 mod github;
+mod guard;
 mod lifecycle;
 mod overview;
 mod relay;
@@ -57,6 +58,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         None => {}
+        Some("gh-guard") => guard::run(),
         Some("setup") => return setup::setup(&http).await,
         Some("doctor") => return setup::doctor(&http).await,
         Some("review") => return review_once(&http, args.get(2)).await,

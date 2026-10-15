@@ -147,7 +147,9 @@ If the network isn't up yet at login, prbot retries every 30 seconds. Checks mis
 
 ## What Claude sees
 
-The prompt includes the PR's title and description, the unified diff, and the full post-change contents of the changed files. Lock files and binaries are left out. Claude does not see the rest of the repository, so it can miss problems that involve files outside the PR. `MAX_REVIEWS_PER_RUN` (default 5) caps how many reviews one check starts. With an API key, each review shows an approximate cost at list prices.
+The prompt includes the PR's title and description, the unified diff, and the full post-change contents of the changed files. Lock files and binaries are left out.
+
+When it needs more context, Claude can look at other code itself: the rest of the PR's repository and any other repository your GitHub login can read (for example the rest of your organisation's repos). It does this with read-only `gh` commands: `gh api` GET requests, `gh search`, `gh repo view|list`, `gh pr view|diff|list` and `gh issue view|list`. A hook (`prbot gh-guard`) checks every command before it runs and blocks anything else: other HTTP methods, request bodies, GraphQL, other hosts, pipes, redirection and every other program. If the hook can't run, every command is denied. This works through Claude Code. With an Anthropic API key, Claude only sees the prompt. Replies to comments never use these commands. `MAX_REVIEWS_PER_RUN` (default 5) caps how many reviews one check starts. With an API key, each review shows an approximate cost at list prices.
 
 ## Building from source
 
