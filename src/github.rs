@@ -1,7 +1,8 @@
 //! Minimal GitHub REST client.
 //!
-//! By design there is no function here to approve, request changes, or merge:
-//! the writes are `post_review` (always event "COMMENT"), `comment`, `reply_to_review_comment` and reactions.
+//! By design there is no function here to approve, request changes, or merge: the writes are
+//! `post_review` (always event "COMMENT"), `comment`, `reply_to_review_comment`, `resolve_thread` and reactions.
+//! Pushing fixes to your own PRs goes through git, in `fixes`.
 
 use crate::review::InlineComment;
 use chrono::{DateTime, Utc};
@@ -57,6 +58,8 @@ pub struct PrInfo {
     pub author: String,
     pub head_sha: String,
     pub head_ref: String,
+    /// "owner/repo" the head branch lives in (differs from the PR's repo for forks).
+    pub head_repo: String,
     pub base_ref: String,
     pub draft: bool,
     pub open: bool,
@@ -106,6 +109,18 @@ impl Comment {
             diff_hunk: v["diff_hunk"].as_str().map(String::from),
         }
     }
+}
+
+/// An inline review thread, with its comments oldest first.
+#[derive(Debug, Clone)]
+pub struct Thread {
+    /// GraphQL node ID, needed to resolve the thread.
+    pub id: String,
+    pub resolved: bool,
+    pub outdated: bool,
+    pub path: String,
+    pub line: Option<u64>,
+    pub comments: Vec<Comment>,
 }
 
 pub struct GitHub {
@@ -173,6 +188,7 @@ impl GitHub {
             author: s(&v["user"]["login"]),
             head_sha: s(&v["head"]["sha"]),
             head_ref: s(&v["head"]["ref"]),
+            head_repo: s(&v["head"]["repo"]["full_name"]),
             base_ref: s(&v["base"]["ref"]),
             draft: v["draft"].as_bool().unwrap_or(false),
             open: v["state"] == "open",
@@ -312,6 +328,74 @@ impl GitHub {
     pub async fn reviews(&self, pr: &PrRef) -> Result<Vec<(String, String)>> {
         let v = self.get_json(&pr.api("/reviews?per_page=100")).await?;
         Ok(v.as_array().into_iter().flatten().map(|r| (s(&r["user"]["login"]), s(&r["state"]))).collect())
+    }
+
+    /// Review summaries with a body (the text submitted with a review), oldest first.
+    pub async fn review_bodies(&self, pr: &PrRef) -> Result<Vec<Comment>> {
+        let v = self.get_json(&pr.api("/reviews?per_page=100")).await?;
+        Ok(v.as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| !s(&r["body"]).trim().is_empty())
+            .map(|r| Comment {
+                created: r["submitted_at"].as_str().and_then(|t| t.parse().ok()).unwrap_or_default(),
+                ..Comment::from_json(r)
+            })
+            .collect())
+    }
+
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        let resp = self
+            .req(Method::POST, format!("{API}/graphql"), "application/vnd.github+json")
+            .json(&json!({ "query": query, "variables": variables }))
+            .send()
+            .await?;
+        let v: Value = ok(resp).await?.json().await?;
+        if let Some(errors) = v["errors"].as_array().filter(|e| !e.is_empty()) {
+            bail!("GitHub GraphQL error: {}", errors.iter().filter_map(|e| e["message"].as_str()).collect::<Vec<_>>().join("; "));
+        }
+        Ok(v["data"].clone())
+    }
+
+    /// Inline review threads (at most 100, with up to 50 comments each).
+    pub async fn review_threads(&self, pr: &PrRef) -> Result<Vec<Thread>> {
+        const Q: &str = "query($owner: String!, $repo: String!, $n: Int!) { repository(owner: $owner, name: $repo) {
+            pullRequest(number: $n) { reviewThreads(first: 100) { nodes { id isResolved isOutdated path line
+                comments(first: 50) { nodes { databaseId body createdAt url diffHunk author { login __typename } } } } } } } }";
+        let data = self.graphql(Q, json!({ "owner": pr.owner, "repo": pr.repo, "n": pr.number })).await?;
+        let nodes = data["repository"]["pullRequest"]["reviewThreads"]["nodes"].as_array().cloned().unwrap_or_default();
+        Ok(nodes
+            .iter()
+            .map(|t| Thread {
+                id: s(&t["id"]),
+                resolved: t["isResolved"].as_bool().unwrap_or(false),
+                outdated: t["isOutdated"].as_bool().unwrap_or(false),
+                path: s(&t["path"]),
+                line: t["line"].as_u64(),
+                comments: t["comments"]["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|c| Comment {
+                        id: c["databaseId"].as_u64().unwrap_or_default(),
+                        author: s(&c["author"]["login"]),
+                        author_is_bot: c["author"]["__typename"] == "Bot",
+                        body: s(&c["body"]),
+                        created: c["createdAt"].as_str().and_then(|t| t.parse().ok()).unwrap_or_default(),
+                        url: s(&c["url"]),
+                        in_reply_to: None,
+                        path: Some(s(&t["path"])),
+                        diff_hunk: c["diffHunk"].as_str().map(String::from),
+                    })
+                    .collect(),
+            })
+            .collect())
+    }
+
+    /// Marks an inline review thread as resolved.
+    pub async fn resolve_thread(&self, thread_id: &str) -> Result<()> {
+        const Q: &str = "mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { isResolved } } }";
+        self.graphql(Q, json!({ "id": thread_id })).await.map(|_| ())
     }
 
     /// Adds a reaction such as "+1" to a review comment.

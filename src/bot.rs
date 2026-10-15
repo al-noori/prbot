@@ -25,6 +25,8 @@ const HELP: &str = "*PR Reviewer*: Claude reviews PRs that request your review, 
 `/prreview weekdays on|off`: skip weekends or not
 `/prreview autopost on|off`: post reviews to the PR automatically, or only when you click
 `/prreview followup on|off`: on PRs with a posted review, re-review new commits and answer replies to Claude's comments and @mentions of you right away
+`/prreview fixes on|off`: on your own PRs, Claude drafts code fixes and replies for review comments; you Apply or Skip them here
+`/prreview fix <PR URL>`: draft fixes for one of your PRs now
 `/prreview model opus|sonnet|haiku|fable`: choose the Claude model (or a full model ID)
 `/prreview effort low|medium|high|xhigh|max`: how hard Claude thinks
 `/prreview scope me|team`: only PRs requesting you directly, or also through your teams
@@ -46,8 +48,8 @@ pub struct Bot {
     started: DateTime<Local>,
     host: String,
     next_run: Mutex<Option<DateTime<Local>>>,
-    in_flight: Mutex<HashSet<String>>,
-    workers: Semaphore,
+    pub(crate) in_flight: Mutex<HashSet<String>>,
+    pub(crate) workers: Semaphore,
 }
 
 impl Bot {
@@ -158,6 +160,11 @@ impl Bot {
         for a in p["actions"].as_array().cloned().unwrap_or_default() {
             match a["action_id"].as_str().unwrap_or_default() {
                 "post_to_github" => self.post_to_github(&p, a["value"].as_str().unwrap_or_default()).await?,
+                "fix_apply" => self.apply_fix(a["value"].as_str().unwrap_or_default()).await?,
+                "fix_skip" => self.skip_fix(a["value"].as_str().unwrap_or_default()).await?,
+                "fixes" => {
+                    self.command(if a["value"] == "on" { "fixes on" } else { "fixes off" }).await?;
+                }
                 "rereview" => {
                     if let Some(pr) = a["value"].as_str().and_then(PrRef::parse) {
                         self.spawn_review(pr);
@@ -206,6 +213,12 @@ impl Bot {
             return match pr {
                 Some(pr) => self.set_done(&pr, first == "done").await,
                 None => Ok(format!("Use `{first} <PR URL>`.")),
+            };
+        }
+        if first == "fix" {
+            return match PrRef::parse(text) {
+                Some(pr) => self.check_own_pr(&pr, true).await,
+                None => Ok("Use `fix <PR URL>` with one of your own PRs.".into()),
             };
         }
         if matches!(first.as_str(), "list" | "prs" | "overview") {
@@ -301,6 +314,18 @@ impl Bot {
                 }
                 _ => "Use `followup on` or `followup off`.".into(),
             },
+            "fixes" => match arg.as_str() {
+                "on" | "off" => {
+                    let on = arg == "on";
+                    self.store.update(|s| s.fixes = on)?;
+                    if on {
+                        "Fixes are *on*. Every 2 minutes within your working hours, I look at your own open PRs. When someone leaves review comments, Claude drafts code fixes and replies, and I send them here. Nothing is pushed or posted until you click *Apply*.".into()
+                    } else {
+                        "Fixes are *off*.".into()
+                    }
+                }
+                _ => "Use `fixes on` or `fixes off`.".into(),
+            },
             "model" => match claude::resolve_model(&arg) {
                 Some(model) if !arg.is_empty() => {
                     self.store.update(|s| s.model = Some(model))?;
@@ -347,9 +372,9 @@ impl Bot {
     pub fn status_text(&self) -> String {
         let st = self.store.get();
         let next = *self.next_run.lock().unwrap();
-        let in_flight = self.in_flight.lock().unwrap().len();
+        let in_flight = self.in_flight.lock().unwrap().iter().filter(|k| !k.starts_with("fix:")).count();
         format!(
-            "*prbot:* :large_green_circle: running on {} since {} (v{}), updated {}\n*Scheduled checks:* {}\n*Schedule:* {}, {}\n*Next check:* {}\n*Last check:* {}\n*Posting:* {}\n*Follow-ups:* {}\n*Scope:* {}\n*Model:* {} via {}\n*Reviews running:* {}",
+            "*prbot:* :large_green_circle: running on {} since {} (v{}), updated {}\n*Scheduled checks:* {}\n*Schedule:* {}, {}\n*Next check:* {}\n*Last check:* {}\n*Posting:* {}\n*Follow-ups:* {}\n*Fixes on your PRs:* {}\n*Scope:* {}\n*Model:* {} via {}\n*Reviews running:* {}",
             self.host,
             fmt_time(self.started),
             env!("CARGO_PKG_VERSION"),
@@ -364,6 +389,11 @@ impl Bot {
                 format!("on, following {} PR(s): re-review new commits, answer replies", st.watched.len())
             } else {
                 "off".into()
+            },
+            match (st.fixes, st.pending_fixes.len()) {
+                (false, _) => "off".to_string(),
+                (true, 0) => "on: drafts fixes for review comments, applied when you click".to_string(),
+                (true, n) => format!("on, {n} draft(s) waiting for Apply or Skip"),
             },
             scope_label(&st.query),
             st.settings().describe(),
@@ -598,6 +628,8 @@ impl Bot {
             json!({ "type": "button", "action_id": "followup", "value": "on",
                     "text": { "type": "plain_text", "text": "Follow-ups: off" } })
         };
+        let fixes = json!({ "type": "button", "action_id": "fixes", "value": if st.fixes { "off" } else { "on" },
+                            "text": { "type": "plain_text", "text": if st.fixes { "Fixes: on" } else { "Fixes: off" } } });
         let settings = st.settings();
         let model_opts: Vec<Value> = claude::MODELS.iter().map(|(short, _, label)| opt(label, &format!("model {short}"))).collect();
         let mut model_select = json!({ "type": "static_select", "action_id": "set_model",
@@ -628,7 +660,7 @@ impl Bot {
                           opt("At 09:00 and 14:00", "at 09:00,14:00"),
                       ] }
                 ] },
-                { "type": "actions", "elements": [model_select, effort_select, followup] },
+                { "type": "actions", "elements": [model_select, effort_select, followup, fixes] },
                 { "type": "divider" },
                 { "type": "input", "block_id": "manual", "dispatch_action": true,
                   "label": { "type": "plain_text", "text": "Review a PR now" },

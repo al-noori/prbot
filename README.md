@@ -53,6 +53,8 @@ Settings are saved to `%APPDATA%\prbot\.env` on Windows or `~/.config/prbot/.env
 | `/prreview weekdays on\|off` | Skip weekends, or include them |
 | `/prreview autopost on\|off` | Post reviews to the PR automatically, or only when you click |
 | `/prreview followup on\|off` | Follow up on PRs with a posted review (see below). Off by default |
+| `/prreview fixes on\|off` | Draft fixes for review comments on your own PRs (see below). Off by default |
+| `/prreview fix <PR URL>` | Draft fixes for one of your PRs now, also for comments drafted before |
 | `/prreview model opus\|sonnet\|haiku\|fable` | Choose the Claude model (or give a full model ID) |
 | `/prreview effort low\|medium\|high\|xhigh\|max` | How hard Claude thinks (Haiku has no effort setting) |
 | `/prreview scope me\|team` | Only PRs requesting you directly, or also through your teams |
@@ -60,7 +62,7 @@ Settings are saved to `%APPDATA%\prbot\.env` on Windows or `~/.config/prbot/.env
 | `/prreview done <PR URL>` / `reopen <PR URL>` | Mark a PR as reviewed by you (stops follow-ups), or undo that |
 | `/prreview <PR URL>` | Review that PR now (or just DM the bot the link) |
 
-The Home tab has the same controls: on/off, check now, schedule, model, effort and follow-ups.
+The Home tab has the same controls: on/off, check now, schedule, model, effort, follow-ups and fixes.
 
 To review a PR in the terminal without Slack, run `prbot review https://github.com/OWNER/REPO/pull/123`.
 
@@ -72,6 +74,19 @@ With `/prreview followup on`, prbot keeps an eye on every PR it has posted a rev
 - **Replies** to Claude's inline comments, and PR comments that @mention you, get an answer from Claude in the same thread, marked as written by Claude and not reviewed by you. If a comment needs no answer (a thanks, an acknowledgement, or something meant for someone else), Claude gives it a 👍 instead.
 
 Comments by bots and by you are never answered, and neither is a comment you've already replied to yourself. Each PR gets at most 5 replies a day. Reviews posted before follow-ups were turned on are followed too, starting from the time they were posted. A PR stops being followed when it's closed or merged, or after 14 days without activity. Every re-review and reply also shows up as a short message in Slack.
+
+## Fixing review comments on your own PRs
+
+With `/prreview fixes on`, prbot also looks at the PRs you opened, every 2 minutes within your working hours. It picks up unresolved review threads where someone else had the last word, plus new conversation comments and review summaries by people (not bots).
+
+For each PR with something new, Claude Code works in a checkout of the PR's head commit. It changes the code where a comment calls for it and drafts a reply for each comment: what it fixed, an answer, or nothing. You get one Slack message with the replies and the diff, and two buttons:
+
+- **Apply** commits the change as you (your git name and email), pushes it to the PR branch and replies in each thread ("Fixed in abc1234: …"). Then it resolves the threads it fixed. Replies are marked as written by Claude and approved by you.
+- **Skip** drops the draft. Those comments aren't drafted again, but `/prreview fix <PR URL>` drafts them anyway.
+
+Nothing is pushed or posted until you click Apply. If the PR gets new commits while a draft waits, the draft is dropped and redone from the new head.
+
+Claude can only read and edit files inside that checkout, except `.git`. It also has the read-only `gh` commands described below, and nothing else: it can't run builds, tests or any other program, so check the diff before you apply it. A hook (`prbot gh-guard`) checks every tool call. The checkouts are kept in a `checkouts` folder next to `.env`. This needs Claude Code; it doesn't work with an Anthropic API key.
 
 ## Overview of your PRs
 

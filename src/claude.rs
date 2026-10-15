@@ -5,6 +5,7 @@
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -108,18 +109,30 @@ impl Claude {
         }
     }
 
-    /// With `repo_access`, Claude Code may run read-only `gh` commands to look at other repositories
-    /// (see `guard`). The API backend has no tools and ignores it.
-    pub async fn complete(&self, settings: &Settings, system: &str, user: &str, repo_access: bool) -> Result<Completion> {
+    /// The API backend has no tools: it ignores `Tools::ReadGh` and can't do `Tools::Edit`.
+    pub async fn complete(&self, settings: &Settings, system: &str, user: &str, tools: Tools<'_>) -> Result<Completion> {
         match &self.backend {
+            Backend::Api { .. } if matches!(tools, Tools::Edit(_)) => {
+                bail!("fixing review comments needs Claude Code; it doesn't work with ANTHROPIC_API_KEY")
+            }
             Backend::Api { http, api_key } => complete_api(http, api_key, settings, system, user).await,
-            Backend::Cli { bin } => complete_cli(bin, settings, system, user, repo_access).await,
+            Backend::Cli { bin } => complete_cli(bin, settings, system, user, tools).await,
         }
     }
 
-    pub fn has_repo_access(&self) -> bool {
+    pub fn has_tools(&self) -> bool {
         matches!(self.backend, Backend::Cli { .. })
     }
+}
+
+/// What Claude Code may do besides answering. Every tool call goes through `prbot gh-guard`.
+#[derive(Clone, Copy)]
+pub enum Tools<'a> {
+    None,
+    /// Read-only `gh` commands, to look at other repositories.
+    ReadGh,
+    /// Read-only `gh`, plus reading and editing files inside this checkout (not `.git`). Runs in it.
+    Edit(&'a Path),
 }
 
 async fn complete_api(http: &Client, api_key: &str, settings: &Settings, system: &str, user: &str) -> Result<Completion> {
@@ -192,34 +205,42 @@ async fn complete_api(http: &Client, api_key: &str, settings: &Settings, system:
 }
 
 /// Runs `claude -p` with no MCP servers and no saved session; the prompt goes in on stdin.
-/// Without `repo_access` it has no tools. With it, it has only Bash, and a command runs only when the
-/// PreToolUse hook `prbot gh-guard` allows it (read-only `gh`); `dontAsk` denies everything else.
-async fn complete_cli(bin: &str, settings: &Settings, system: &str, user: &str, repo_access: bool) -> Result<Completion> {
+/// With tools, a call runs only when the PreToolUse hook `prbot gh-guard` allows it; there are no allow
+/// rules, so `dontAsk` denies everything else, also when the hook can't run.
+async fn complete_cli(bin: &str, settings: &Settings, system: &str, user: &str, tools: Tools<'_>) -> Result<Completion> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(["-p", "--model", &settings.model]);
     if settings.uses_effort() {
         cmd.args(["--effort", &settings.effort]);
     }
-    if repo_access {
+    // Forward slashes and quotes, so the hook command also works in Git Bash on Windows.
+    let quote = |p: &Path| format!("\"{}\"", p.display().to_string().replace('\\', "/"));
+    let (tool_list, root) = match tools {
+        Tools::None => ("", None),
+        Tools::ReadGh => ("Bash", None),
+        Tools::Edit(root) => ("Bash,Read,Edit,Write,Glob,Grep", Some(root)),
+    };
+    if !tool_list.is_empty() {
         let exe = std::env::current_exe().context("could not find the prbot executable")?;
-        // Forward slashes and quotes, so the hook command also works in Git Bash on Windows.
-        let hook = format!("\"{}\" gh-guard", exe.display().to_string().replace('\\', "/"));
+        let mut hook = format!("{} gh-guard", quote(&exe));
+        if let Some(root) = root {
+            hook.push_str(&format!(" {}", quote(root)));
+        }
         let hooks = json!({ "hooks": { "PreToolUse": [
             { "matcher": "*", "hooks": [{ "type": "command", "command": hook }] }
         ]}});
-        cmd.args(["--tools", "Bash", "--permission-mode", "dontAsk", "--settings", &hooks.to_string()]);
-    } else {
-        cmd.args(["--tools", ""]);
+        cmd.args(["--permission-mode", "dontAsk", "--settings", &hooks.to_string()]);
     }
     let mut child = cmd
         .args([
+            "--tools", tool_list,
             "--output-format", "json",
             "--strict-mcp-config",
             "--no-session-persistence",
             "--system-prompt", system,
         ])
-        // A neutral directory, so no project CLAUDE.md is picked up.
-        .current_dir(std::env::temp_dir())
+        // The checkout when editing (so its CLAUDE.md applies); otherwise a neutral directory.
+        .current_dir(root.map(Path::to_path_buf).unwrap_or_else(std::env::temp_dir))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

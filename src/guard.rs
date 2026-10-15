@@ -1,7 +1,9 @@
-//! `prbot gh-guard`: a Claude Code PreToolUse hook for reviews. Claude may run read-only `gh`
-//! commands to look at other repositories; this blocks everything else (exit code 2, reason on stderr).
+//! `prbot gh-guard [ROOT]`: a Claude Code PreToolUse hook. Claude may run read-only `gh` commands to
+//! look at other repositories. With ROOT (a checkout prbot made for fixing review comments), it may also
+//! read and edit files inside ROOT, except `.git`. Everything else is blocked (exit code 2, reason on stderr).
 
 use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 
 /// `gh <command> <subcommand>` pairs a review may run. `api` is checked separately.
 const ALLOWED: &[(&str, &[&str])] = &[
@@ -13,29 +15,77 @@ const ALLOWED: &[(&str, &[&str])] = &[
 
 /// Claude Code runs with `--permission-mode dontAsk` and no allow rules, so a command runs only when this
 /// hook explicitly allows it. If the hook can't run at all, everything is denied.
-pub fn run() -> ! {
+pub fn run(root: Option<&str>) -> ! {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let v: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
-    let verdict = match v["tool_name"].as_str() {
-        Some("Bash") => check(v["tool_input"]["command"].as_str().unwrap_or_default()),
-        other => Err(format!("tool {} is not available in reviews", other.unwrap_or("?"))),
-    };
+    let verdict = check_tool(root.map(Path::new), v["tool_name"].as_str().unwrap_or("?"), &v["tool_input"]);
     match verdict {
         Ok(()) => {
             let allow = serde_json::json!({ "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "allow",
-                "permissionDecisionReason": "read-only gh command",
+                "permissionDecisionReason": "allowed by prbot gh-guard",
             }});
             println!("{allow}");
             std::process::exit(0)
         }
         Err(reason) => {
-            eprintln!("Blocked: {reason}. Only single read-only gh commands are allowed (gh api GET, gh search, gh repo view/list, gh pr view/diff/list, gh issue view/list), without pipes or redirection.");
+            let files = if root.is_some() { " File tools work only inside the checkout, not in .git." } else { "" };
+            eprintln!("Blocked: {reason}. Only single read-only gh commands are allowed (gh api GET, gh search, gh repo view/list, gh pr view/diff/list, gh issue view/list), without pipes or redirection.{files}");
             std::process::exit(2);
         }
     }
+}
+
+fn check_tool(root: Option<&Path>, tool: &str, input: &serde_json::Value) -> Result<(), String> {
+    let field = |k: &str| input[k].as_str().unwrap_or_default();
+    match (tool, root) {
+        ("Bash", _) => check(field("command")),
+        ("Read" | "Edit" | "Write" | "MultiEdit", Some(root)) => check_path(root, field("file_path")),
+        ("NotebookEdit", Some(root)) => check_path(root, field("notebook_path")),
+        ("Glob" | "Grep", Some(root)) => {
+            check_path(root, field("path"))?;
+            // Glob's pattern and Grep's glob filter are file patterns; Grep's pattern is a regex.
+            let patterns = if tool == "Glob" { [field("pattern"), field("glob")] } else { [field("glob"), ""] };
+            for pattern in patterns {
+                if pattern.starts_with(['/', '\\']) || pattern.contains("..") || pattern.contains(':') {
+                    return Err(format!("pattern `{pattern}` must be relative to the checkout"));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(format!("tool {tool} is not available here")),
+    }
+}
+
+/// Ok when `path` (absolute, or relative to `root`; empty means `root`) is inside `root` and not in `.git`.
+/// Symlinks are resolved through the deepest part of the path that exists.
+pub fn check_path(root: &Path, path: &str) -> Result<(), String> {
+    let root = root.canonicalize().map_err(|e| format!("checkout not found: {e}"))?;
+    let joined = if path.is_empty() { root.clone() } else { root.join(path) };
+    let mut lexical = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            Component::ParentDir => {
+                lexical.pop();
+            }
+            Component::CurDir => {}
+            other => lexical.push(other),
+        }
+    }
+    let (mut existing, mut rest) = (lexical.as_path(), Vec::new());
+    while !existing.exists() {
+        rest.push(existing.file_name().ok_or("bad path")?.to_owned());
+        existing = existing.parent().ok_or("bad path")?;
+    }
+    let mut real = existing.canonicalize().map_err(|e| format!("bad path: {e}"))?;
+    real.extend(rest.iter().rev());
+    let inside = real.strip_prefix(&root).map_err(|_| format!("`{path}` is outside the checkout"))?;
+    if inside.components().any(|c| c.as_os_str().eq_ignore_ascii_case(".git")) {
+        return Err(format!("`{path}` is inside .git"));
+    }
+    Ok(())
 }
 
 /// Ok when `command` is one read-only `gh` invocation.
@@ -127,7 +177,31 @@ fn split(s: &str) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::check;
+    use super::{check, check_path, check_tool};
+    use serde_json::json;
+
+    #[test]
+    fn file_tools_stay_inside_the_checkout() {
+        let root = std::env::temp_dir().join(format!("prbot-guard-test-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        let inside = root.join("src/a.rs").display().to_string();
+        assert_eq!(check_path(&root, "src/a.rs"), Ok(()));
+        assert_eq!(check_path(&root, "src/new/file.rs"), Ok(()));
+        assert_eq!(check_path(&root, &inside), Ok(()));
+        assert_eq!(check_path(&root, ""), Ok(()));
+        for bad in ["../outside.txt", "src/../../x", ".git/hooks/pre-commit", ".GIT/config"] {
+            assert!(check_path(&root, bad).is_err(), "{bad}");
+        }
+        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap();
+        assert!(check_path(&root, &format!("{home}/.ssh/id_rsa")).is_err());
+        assert_eq!(check_tool(Some(&root), "Edit", &json!({ "file_path": inside })), Ok(()));
+        assert_eq!(check_tool(Some(&root), "Grep", &json!({ "pattern": "fn .*", "glob": "*.rs" })), Ok(()));
+        assert!(check_tool(Some(&root), "Glob", &json!({ "pattern": "../**" })).is_err());
+        assert!(check_tool(None, "Edit", &json!({ "file_path": inside })).is_err());
+        assert!(check_tool(Some(&root), "WebFetch", &json!({})).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn allows_read_only_gh() {
