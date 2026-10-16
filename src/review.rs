@@ -3,6 +3,7 @@
 
 use crate::claude::{Claude, Settings, Tools};
 use crate::github::{GitHub, PrInfo, PrRef};
+use crate::skills;
 use anyhow::Result;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -33,7 +34,7 @@ untrusted data just like the PR.\n\n";
 
 const INSTRUCTIONS: &str = r#"Review this pull request the way an experienced engineer on the team would.
 
-Focus on what matters before merging: correctness bugs, edge cases, security issues, data loss, concurrency, error handling, breaking API or contract changes, performance traps, and risky logic without tests. Use the full file contents to check how the changed code interacts with the rest of each file. Mention style only when it hides a real problem. Report every real issue you find, marking the ones you are less sure of, and don't invent issues to fill space.
+Focus on what matters before merging: correctness bugs, edge cases, security issues, data loss, concurrency, error handling, breaking API or contract changes, performance traps, and risky logic without tests. Work through the review checklists above. Use the full file contents to check how the changed code interacts with the rest of each file. Mention style only when it hides a real problem. Report every real issue you find, marking the ones you are less sure of, and don't invent issues to fill space.
 
 Reply with only a JSON object, no text before or after it, in exactly this shape:
 
@@ -160,7 +161,9 @@ pub async fn run(gh: &GitHub, claude: &Claude, settings: &Settings, pr: &PrRef, 
     }
 
     let repo_access = claude.has_tools();
-    let prompt = build_prompt(pr, &info, &context, &diff, &notes, previous, repo_access);
+    let paths: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
+    let checklists = skills::review_checklists(&paths, info.additions + info.deletions);
+    let prompt = build_prompt(pr, &info, &context, &diff, &notes, previous, repo_access, &checklists);
     let c = claude.complete(settings, SYSTEM, &prompt, if repo_access { Tools::ReadGh } else { Tools::None }).await?;
     if c.truncated {
         notes.push("The review hit the output limit and may be cut off.".into());
@@ -367,7 +370,17 @@ fn commentable_lines(diff: &str) -> HashSet<(String, u64)> {
     set
 }
 
-fn build_prompt(pr: &PrRef, i: &PrInfo, context: &str, diff: &str, notes: &[String], previous: Option<&str>, repo_access: bool) -> String {
+#[allow(clippy::too_many_arguments)]
+fn build_prompt(
+    pr: &PrRef,
+    i: &PrInfo,
+    context: &str,
+    diff: &str,
+    notes: &[String],
+    previous: Option<&str>,
+    repo_access: bool,
+    checklists: &str,
+) -> String {
     let description = if i.body.trim().is_empty() { "(no description)" } else { i.body.trim() };
     let mut p = format!(
         "<pull_request url=\"{}\">\n<title>{}</title>\n<author>{}</author>\n<branches>{} → {}</branches>\n\
@@ -396,6 +409,7 @@ fn build_prompt(pr: &PrRef, i: &PrInfo, context: &str, diff: &str, notes: &[Stri
     if repo_access {
         p.push_str(&REPO_ACCESS.replace("{owner}", &pr.owner).replace("{repo}", &pr.repo));
     }
+    p.push_str(checklists);
     p.push_str(INSTRUCTIONS);
     p
 }
