@@ -86,7 +86,7 @@ For each PR with something new, Claude Code works in a checkout of the PR's head
 
 Nothing is pushed or posted until you click Apply. If the PR gets new commits while a draft waits, the draft is dropped and redone from the new head.
 
-Claude can only read and edit files inside that checkout, except `.git`. It also has the read-only `gh` commands described below, and nothing else: it can't run builds, tests or any other program, so check the diff before you apply it. A hook (`prbot gh-guard`) checks every tool call. The checkouts are kept in a `checkouts` folder next to `.env`. This needs Claude Code; it doesn't work with an Anthropic API key.
+Claude can only read and edit files inside that checkout, except `.git`. It also has the read-only `gh` commands described below, and nothing else: it can't run builds, tests or any other program, so check the diff before you apply it. A hook (`prbot gh-guard`) checks every tool call. Claude Code loads only your own user settings here, never the repository's `.claude/settings.json`, `.mcp.json` or `CLAUDE.md`, because their hooks and servers could run commands around the guard. Claude can't change those files in the checkout either. It still reads the repository's `CLAUDE.md` or `AGENTS.md` for coding conventions. The checkouts are kept in a `checkouts` folder next to `.env`. This needs Claude Code; it doesn't work with an Anthropic API key.
 
 ## Overview of your PRs
 

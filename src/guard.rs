@@ -1,6 +1,7 @@
 //! `prbot gh-guard [ROOT]`: a Claude Code PreToolUse hook. Claude may run read-only `gh` commands to
 //! look at other repositories. With ROOT (a checkout prbot made for fixing review comments), it may also
-//! read and edit files inside ROOT, except `.git`. Everything else is blocked (exit code 2, reason on stderr).
+//! read and edit files inside ROOT, except `.git`, and it may not change Claude's own configuration there
+//! (`.claude/`, `.mcp.json`, `CLAUDE.md`). Everything else is blocked (exit code 2, reason on stderr).
 
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -31,7 +32,11 @@ pub fn run(root: Option<&str>) -> ! {
             std::process::exit(0)
         }
         Err(reason) => {
-            let files = if root.is_some() { " File tools work only inside the checkout, not in .git." } else { "" };
+            let files = if root.is_some() {
+                " File tools work only inside the checkout, not in .git, and can't change .claude/, .mcp.json or CLAUDE.md."
+            } else {
+                ""
+            };
             eprintln!("Blocked: {reason}. Only single read-only gh commands are allowed (gh api GET, gh search, gh repo view/list, gh pr view/diff/list, gh issue view/list), without pipes or redirection.{files}");
             std::process::exit(2);
         }
@@ -42,8 +47,9 @@ fn check_tool(root: Option<&Path>, tool: &str, input: &serde_json::Value) -> Res
     let field = |k: &str| input[k].as_str().unwrap_or_default();
     match (tool, root) {
         ("Bash", _) => check(field("command")),
-        ("Read" | "Edit" | "Write" | "MultiEdit", Some(root)) => check_path(root, field("file_path")),
-        ("NotebookEdit", Some(root)) => check_path(root, field("notebook_path")),
+        ("Read", Some(root)) => check_path(root, field("file_path")),
+        ("Edit" | "Write" | "MultiEdit", Some(root)) => check_writable(root, field("file_path")),
+        ("NotebookEdit", Some(root)) => check_writable(root, field("notebook_path")),
         ("Glob" | "Grep", Some(root)) => {
             check_path(root, field("path"))?;
             // Glob's pattern and Grep's glob filter are file patterns; Grep's pattern is a regex.
@@ -59,9 +65,29 @@ fn check_tool(root: Option<&Path>, tool: &str, input: &serde_json::Value) -> Res
     }
 }
 
+/// Ok when `path` may be edited: `check_path`, and not a file that configures Claude Code. Those would
+/// change what later sessions in this repository load (hooks, MCP servers, instructions).
+fn check_writable(root: &Path, path: &str) -> Result<(), String> {
+    let inside = resolve(root, path)?;
+    let is = |c: &std::ffi::OsStr, name: &str| c.eq_ignore_ascii_case(name);
+    let config = inside.components().any(|c| is(c.as_os_str(), ".claude"))
+        || inside
+            .file_name()
+            .is_some_and(|f| [".mcp.json", "CLAUDE.md", "CLAUDE.local.md"].iter().any(|n| is(f, n)));
+    if config {
+        return Err(format!("`{path}` configures Claude Code and can't be changed here"));
+    }
+    Ok(())
+}
+
 /// Ok when `path` (absolute, or relative to `root`; empty means `root`) is inside `root` and not in `.git`.
 /// Symlinks are resolved through the deepest part of the path that exists.
 pub fn check_path(root: &Path, path: &str) -> Result<(), String> {
+    resolve(root, path).map(|_| ())
+}
+
+/// `path` relative to the canonical `root`, after the checks of `check_path`.
+fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     let root = root.canonicalize().map_err(|e| format!("checkout not found: {e}"))?;
     let joined = if path.is_empty() { root.clone() } else { root.join(path) };
     let mut lexical = PathBuf::new();
@@ -85,7 +111,7 @@ pub fn check_path(root: &Path, path: &str) -> Result<(), String> {
     if inside.components().any(|c| c.as_os_str().eq_ignore_ascii_case(".git")) {
         return Err(format!("`{path}` is inside .git"));
     }
-    Ok(())
+    Ok(inside.to_path_buf())
 }
 
 /// Ok when `command` is one read-only `gh` invocation.
@@ -200,6 +226,31 @@ mod tests {
         assert!(check_tool(Some(&root), "Glob", &json!({ "pattern": "../**" })).is_err());
         assert!(check_tool(None, "Edit", &json!({ "file_path": inside })).is_err());
         assert!(check_tool(Some(&root), "WebFetch", &json!({})).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn claude_config_in_the_checkout_stays_read_only() {
+        let root = std::env::temp_dir().join(format!("prbot-guard-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(root.join(".claude/settings.json"), "{}").unwrap();
+        for bad in [
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".Claude/agents/x.md",
+            "sub/.claude/settings.json",
+            ".mcp.json",
+            "CLAUDE.md",
+            "docs/claude.md",
+            "CLAUDE.local.md",
+        ] {
+            for tool in ["Edit", "Write", "MultiEdit"] {
+                assert!(check_tool(Some(&root), tool, &json!({ "file_path": bad })).is_err(), "{tool} {bad}");
+            }
+        }
+        assert!(check_tool(Some(&root), "NotebookEdit", &json!({ "notebook_path": ".claude/x.ipynb" })).is_err());
+        assert_eq!(check_tool(Some(&root), "Read", &json!({ "file_path": ".claude/settings.json" })), Ok(()));
+        assert_eq!(check_tool(Some(&root), "Write", &json!({ "file_path": "docs/claude-notes.md" })), Ok(()));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -207,6 +207,9 @@ async fn complete_api(http: &Client, api_key: &str, settings: &Settings, system:
 /// Runs `claude -p` with no MCP servers and no saved session; the prompt goes in on stdin.
 /// With tools, a call runs only when the PreToolUse hook `prbot gh-guard` allows it; there are no allow
 /// rules, so `dontAsk` denies everything else, also when the hook can't run.
+/// Only your user settings (plus the hook passed with `--settings`) are loaded: a checkout's own
+/// `.claude/settings*.json` could otherwise add hooks that run any command, around the guard.
+/// This also leaves out the checkout's CLAUDE.md.
 async fn complete_cli(bin: &str, settings: &Settings, system: &str, user: &str, tools: Tools<'_>) -> Result<Completion> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(["-p", "--model", &settings.model]);
@@ -236,10 +239,11 @@ async fn complete_cli(bin: &str, settings: &Settings, system: &str, user: &str, 
             "--tools", tool_list,
             "--output-format", "json",
             "--strict-mcp-config",
+            "--setting-sources", "user",
             "--no-session-persistence",
             "--system-prompt", system,
         ])
-        // The checkout when editing (so its CLAUDE.md applies); otherwise a neutral directory.
+        // The checkout when editing (its CLAUDE.md isn't loaded, see above; the fix prompt points to it); otherwise a neutral directory.
         .current_dir(root.map(Path::to_path_buf).unwrap_or_else(std::env::temp_dir))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
