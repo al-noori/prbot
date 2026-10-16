@@ -8,6 +8,7 @@ use crate::bot::Bot;
 use crate::claude::Tools;
 use crate::github::{Comment, PrInfo, PrRef, Thread};
 use crate::review;
+use crate::skills;
 use crate::slack;
 use crate::state::{FixItem, OwnPr, PendingFix};
 use anyhow::{bail, Context, Result};
@@ -48,7 +49,7 @@ When you're done editing, reply with only a JSON object, no text before or after
   ]
 }
 
-One entry per item ref. Replies are short GitHub Markdown, without greeting or sign-off."#;
+One entry per item ref. Replies are short GitHub Markdown, without greeting or sign-off or thanks. Nothing was built or tested, so never say a change is tested or verified."#;
 
 /// Something on the PR that waits for you.
 enum Item {
@@ -285,6 +286,7 @@ impl Bot {
                 p.push_str(&format!("The files these threads are on: {}. Read them before changing anything.\n\n", shown.join(", ")));
             }
         }
+        p.push_str(&skills::receiving_review());
         p.push_str(INSTRUCTIONS);
         p
     }
