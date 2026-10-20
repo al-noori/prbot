@@ -6,6 +6,7 @@ use crate::bot::Bot;
 use crate::claude::Tools;
 use crate::github::{Comment, PrRef};
 use crate::review;
+use crate::skills;
 use crate::slack;
 use crate::state::Watch;
 use anyhow::Result;
@@ -241,8 +242,10 @@ impl Bot {
             prompt.push_str(&format!("<comment author=\"{}\" id=\"{}\">\n{}\n</comment>\n", c.author, c.id, c.body));
         }
         prompt.push_str(&format!(
-            "</thread>\n\nThe comment to answer is id {} by {}.\n\n{INSTRUCTIONS}",
-            comment.id, comment.author
+            "</thread>\n\nThe comment to answer is id {} by {}.\n\n{}{INSTRUCTIONS}",
+            comment.id,
+            comment.author,
+            skills::receiving_review()
         ));
 
         let settings = self.store.get().settings();

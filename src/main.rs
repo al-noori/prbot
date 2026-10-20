@@ -10,6 +10,7 @@ mod overview;
 mod relay;
 mod review;
 mod setup;
+mod skills;
 mod slack;
 mod state;
 

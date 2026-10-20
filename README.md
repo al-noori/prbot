@@ -86,7 +86,7 @@ For each PR with something new, Claude Code works in a checkout of the PR's head
 
 Nothing is pushed or posted until you click Apply. If the PR gets new commits while a draft waits, the draft is dropped and redone from the new head.
 
-Claude can only read and edit files inside that checkout, except `.git`. It also has the read-only `gh` commands described below, and nothing else: it can't run builds, tests or any other program, so check the diff before you apply it. A hook (`prbot gh-guard`) checks every tool call. The checkouts are kept in a `checkouts` folder next to `.env`. This needs Claude Code; it doesn't work with an Anthropic API key.
+Claude can only read and edit files inside that checkout, except `.git`. It also has the read-only `gh` commands described below, and nothing else: it can't run builds, tests or any other program, so check the diff before you apply it. A hook (`prbot gh-guard`) checks every tool call. Claude Code loads only your own user settings here, never the repository's `.claude/settings.json`, `.mcp.json` or `CLAUDE.md`, because their hooks and servers could run commands around the guard. Claude can't change those files in the checkout either. It still reads the repository's `CLAUDE.md` or `AGENTS.md` for coding conventions. The checkouts are kept in a `checkouts` folder next to `.env`. This needs Claude Code; it doesn't work with an Anthropic API key.
 
 ## Overview of your PRs
 
@@ -165,6 +165,8 @@ If the network isn't up yet at login, prbot retries every 30 seconds. Checks mis
 The prompt includes the PR's title and description, the unified diff, and the full post-change contents of the changed files. Lock files and binaries are left out.
 
 When it needs more context, Claude can look at other code itself: the rest of the PR's repository and any other repository your GitHub login can read (for example the rest of your organisation's repos). It does this with read-only `gh` commands: `gh api` GET requests, `gh search`, `gh repo view|list`, `gh pr view|diff|list` and `gh issue view|list`. A hook (`prbot gh-guard`) checks every command before it runs and blocks anything else: other HTTP methods, request bodies, GraphQL, other hosts, pipes, redirection and every other program. If the hook can't run, every command is denied. This works through Claude Code. With an Anthropic API key, Claude only sees the prompt. Replies to comments never use these commands. `MAX_REVIEWS_PER_RUN` (default 5) caps how many reviews one check starts. With an API key, each review shows an approximate cost at list prices.
+
+Reviews also carry the review checklists from [gstack](https://github.com/garrytan/gstack) (MIT). The core checklist plus the security, testing and maintainability lists always go in. The API contract, data migration and performance lists are added when the changed paths suggest them (controllers, migrations, SQL, caches and the like). Simplification is added above 100 changed lines, and a red-team pass above 200. Claude is asked to try to refute each finding against the code before reporting it. Fix drafts and replies to comments follow the receiving-code-review skill from [superpowers](https://github.com/obra/superpowers) (MIT): Claude checks each point against the code, pushes back when a reviewer is wrong and skips the performative agreement. The vendored copies, with their licenses, are in `skills/`.
 
 ## Building from source
 
